@@ -30,6 +30,13 @@ in
   measured-boot = runTest ./lanzaboote/measured-boot.nix;
   auto-reboot = runTest ./lanzaboote/auto-reboot.nix;
 
+  luks-tpm2 = runTest ./lanzaboote/luks-tpm2.nix;
+  luks-tpm2-combined = runTest ./lanzaboote/luks-tpm2-combined.nix;
+  luks-tpm2-initrd = runTest ./lanzaboote/luks-tpm2-initrd.nix;
+  pcr-signing = runTest ./lanzaboote/pcr-signing.nix;
+  pcrlock = runTest ./lanzaboote/pcrlock.nix;
+  pcrlock-rollforward = runTest ./lanzaboote/pcrlock-rollforward.nix;
+
   systemd-pcrlock = runTest ./lanzaboote/systemd-pcrlock.nix;
   systemd-measure = runTest ./lanzaboote/systemd-measure.nix;
   systemd-measured-uki = runTest ./lanzaboote/systemd-measured-uki.nix;
