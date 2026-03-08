@@ -12,8 +12,10 @@ use alloc::vec::Vec;
 use linux_bootloader::companions::{
     discover_credentials, discover_system_extensions, get_default_dropin_directory,
 };
+use linux_bootloader::cpio::pack_cpio_literal;
 use linux_bootloader::efivars::{EfiLoaderFeatures, export_efi_variables, get_loader_features};
 use linux_bootloader::measure::{measure_companion_initrds, measure_image};
+use linux_bootloader::pe_section::pe_section;
 use linux_bootloader::tpm::tpm_available;
 use linux_bootloader::uefi_helpers::booted_image_file;
 use log::{info, warn};
@@ -80,6 +82,48 @@ fn main() -> Status {
     // A list of dynamically assembled initrds, e.g. credential initrds or system extension
     // initrds.
     let mut dynamic_initrds: Vec<Vec<u8>> = Vec::new();
+
+    // Extract .pcrsig and .pcrpkey from our own PE image and deliver them as
+    // CPIO archives in the initrd. These are NOT measured as companions — .pcrsig
+    // is excluded from measurement per spec, and .pcrpkey is already measured as a
+    // PE section during measure_image().
+    //
+    // SAFETY: pe_in_memory is our own loaded PE image and is not concurrently mutated.
+    let pe_data = unsafe { pe_in_memory.as_slice() };
+    let pcrsig_data = pe_section(pe_data, ".pcrsig");
+    let pcrpkey_data = pe_section(pe_data, ".pcrpkey");
+
+    if pcrsig_data.is_some() != pcrpkey_data.is_some() {
+        warn!("Only one of .pcrsig/.pcrpkey found in PE — PCR signature verification will not work");
+    }
+
+    if let Some(pcrsig_data) = pcrsig_data {
+        info!("Extracting .pcrsig section to initrd...");
+        match pack_cpio_literal(
+            &pcrsig_data,
+            uefi::cstr16!("tpm2-pcr-signature.json").as_ref(),
+            ".extra",
+            0o555,
+            0o444,
+        ) {
+            Ok(cpio) => dynamic_initrds.push(cpio.into_inner()),
+            Err(e) => warn!("Failed to pack .pcrsig into CPIO archive: {:?}", e),
+        }
+    }
+
+    if let Some(pcrpkey_data) = pcrpkey_data {
+        info!("Extracting .pcrpkey section to initrd...");
+        match pack_cpio_literal(
+            &pcrpkey_data,
+            uefi::cstr16!("tpm2-pcr-public-key.pem").as_ref(),
+            ".extra",
+            0o555,
+            0o444,
+        ) {
+            Ok(cpio) => dynamic_initrds.push(cpio.into_inner()),
+            Err(e) => warn!("Failed to pack .pcrpkey into CPIO archive: {:?}", e),
+        }
+    }
 
     {
         // This is a block for doing filesystem operations once and for all, related to companion

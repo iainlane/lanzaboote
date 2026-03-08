@@ -134,21 +134,16 @@ pub fn lanzaboote_image(
         s(".linuxh", &kernel_hash_file, kernel_hash_offs),
     ];
 
-    let mut next_offs = kernel_hash_offs + file_size(&kernel_hash_file)?;
-
-    if let (Some(pcrsig), Some(pcrpkey)) = (
-        &stub_parameters.pcrsig_data,
-        &stub_parameters.pcrpkey_data,
-    ) {
+    if let (Some(pcrsig), Some(pcrpkey)) =
+        (&stub_parameters.pcrsig_data, &stub_parameters.pcrpkey_data)
+    {
         let pcrsig_file = tempdir.write_secure_file(pcrsig)?;
         let pcrpkey_file = tempdir.write_secure_file(pcrpkey)?;
-        let pcrsig_offs = next_offs;
+        let pcrsig_offs = kernel_hash_offs + file_size(&kernel_hash_file)?;
         let pcrpkey_offs = pcrsig_offs + file_size(&pcrsig_file)?;
         sections.push(s(".pcrsig", pcrsig_file, pcrsig_offs));
         sections.push(s(".pcrpkey", &pcrpkey_file, pcrpkey_offs));
-        next_offs = pcrpkey_offs + file_size(&pcrpkey_file)?;
     }
-    let _ = next_offs;
 
     let image_path = tempdir.path().join(tmpname());
     wrap_in_pe(
