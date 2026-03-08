@@ -52,6 +52,60 @@ let
       echo "Predicting the PCR state for future boots..."
       ${makePolicyCommand}
     ''
+    # lock-pe: predict PCR 4 for all installed boot PE binaries.
+    # Each unique PE binary gets a .pcrlock variant file under prefix
+    # 775, which falls inside the upstream systemd-pcrlock-make-policy
+    # service's --location=770 range. The service updates the NV index
+    # at next boot; the hook should be initialised manually the first
+    # time (systemd-pcrlock make-policy --recovery-pin=show).
+    + lib.optionalString config.systemd.pcrlock.enable ''
+      pcrlock_dir="/var/lib/pcrlock.d/775-boot-entry.pcrlock.d"
+      mkdir -p "$pcrlock_dir"
+      declare -A current_hashes
+
+      lock_pe_file() {
+        local pe_file="$1"
+        local hash
+        hash="$(sha256sum "$pe_file" | cut -d' ' -f1)"
+        current_hashes["$hash"]=1
+        if [ ! -f "$pcrlock_dir/$hash.pcrlock" ]; then
+          ${config.systemd.package}/lib/systemd/systemd-pcrlock lock-pe \
+            --pcrlock="$pcrlock_dir/$hash.pcrlock" "$pe_file" || \
+            echo "warning: lock-pe failed for $pe_file" >&2
+        fi
+      }
+
+      # lock-pe systemd-boot (glob handles x64/aa64/etc.)
+      for bootloader in "${espMountPoint}/EFI/systemd/systemd-boot"*".efi"; do
+        [ -f "$bootloader" ] || continue
+        lock_pe_file "$bootloader"
+      done
+
+      # lock-pe all lanzaboote stubs
+      for stub in "${espMountPoint}/EFI/Linux/nixos-"*".efi"; do
+        [ -f "$stub" ] || continue
+        lock_pe_file "$stub"
+      done
+
+      # GC: remove .pcrlock files for PE hashes no longer on ESP
+      for old in "$pcrlock_dir"/*.pcrlock; do
+        [ -f "$old" ] || continue
+        hash="$(basename "$old" .pcrlock)"
+        if [ -z "''${current_hashes[$hash]+x}" ]; then
+          rm -f "$old"
+        fi
+      done
+
+      # Remove empty directory to avoid zeroing predictions
+      if [ -z "$(ls -A "$pcrlock_dir" 2>/dev/null)" ]; then
+        rmdir "$pcrlock_dir" 2>/dev/null || true
+      fi
+
+      # Update the NV index and ESP credential so the next boot can unlock.
+      # Uses the same --location as the upstream service unit
+      # (--location=770) to produce identical predictions.
+      ${config.systemd.package}/lib/systemd/systemd-pcrlock make-policy --recovery-pin=no --location=770 || echo "warning: systemd-pcrlock make-policy failed; pcrlock policy may be stale" >&2
+    ''
   );
 
   format = pkgs.formats.yaml { };
@@ -217,6 +271,23 @@ in
       '';
     };
 
+    pcrSigning = {
+      enable = lib.mkEnableOption "PCR 11 signing for measured boot";
+      privateKeyFile = lib.mkOption {
+        type = lib.types.externalPath;
+        description = ''
+          Private key for signing PCR 11 predictions.
+        '';
+      };
+      publicKeyFile = lib.mkOption {
+        type = lib.types.path;
+        description = ''
+          Public key for PCR 11 signature verification. Embedded in the UKI
+          as a .pcrpkey PE section.
+        '';
+      };
+    };
+
     installCommand = lib.mkOption {
       type = lib.types.str;
       readOnly = true;
@@ -234,7 +305,11 @@ in
           --systemd-boot-loader-config ${loaderConfigFile} \
           --configuration-limit ${toString configurationLimit} \
           --allow-unsigned ${lib.boolToString cfg.allowUnsigned} \
-          --bootcounting-initial-tries ${toString cfg.bootCounting.initialTries}'';
+          --bootcounting-initial-tries ${toString cfg.bootCounting.initialTries}''
+        + lib.optionalString cfg.pcrSigning.enable ''
+           \
+          --pcr-private-key ${cfg.pcrSigning.privateKeyFile} \
+          --pcr-public-key ${cfg.pcrSigning.publicKeyFile}'';
       defaultText = lib.literalExpression ''
         ''${lib.getExe config.boot.lanzaboote.package} ''${lib.optionalString (config.boot.lanzaboote.logLevel == "debug") "-vv"} install \
           --system ''${config.boot.kernelPackages.stdenv.hostPlatform.system} \

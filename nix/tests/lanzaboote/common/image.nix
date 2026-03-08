@@ -48,6 +48,10 @@ let
           --private-key ${cfg.privateKeyFile} \
         ''
     )
+    + lib.optionalString config.lanzabooteTest.pcrSigningKeyFixture ''
+          --pcr-private-key ${../../fixtures/pcr-signing/pcr-private-key.pem} \
+          --pcr-public-key ${../../fixtures/pcr-signing/pcr-public-key.pem} \
+    ''
     + ''
       $out \
       system-1-link

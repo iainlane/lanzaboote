@@ -11,6 +11,8 @@ in
       default = config.virtualisation.useSecureBoot;
     };
 
+    pcrSigningKeyFixture = lib.mkEnableOption "PCR signing key fixtures baked into the image";
+
     persistentRoot = lib.mkEnableOption "a persistent root filesystem";
   };
 
