@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::os::unix::prelude::{OsStrExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::string::ToString;
 
 use anyhow::{Context, Result, anyhow};
@@ -33,6 +34,8 @@ pub struct InstallerBuilder {
     configuration_limit: usize,
     bootcounting_initial_tries: u32,
     pcrlock_directory: Option<PathBuf>,
+    pcr_private_key: Option<PathBuf>,
+    pcr_public_key: Option<PathBuf>,
     esp: PathBuf,
     generation_links: Vec<PathBuf>,
 }
@@ -47,6 +50,8 @@ impl InstallerBuilder {
         configuration_limit: usize,
         bootcounting_initial_tries: u32,
         pcrlock_directory: Option<PathBuf>,
+        pcr_private_key: Option<PathBuf>,
+        pcr_public_key: Option<PathBuf>,
         esp: PathBuf,
         generation_links: Vec<PathBuf>,
     ) -> Self {
@@ -58,6 +63,8 @@ impl InstallerBuilder {
             configuration_limit,
             bootcounting_initial_tries,
             pcrlock_directory,
+            pcr_private_key,
+            pcr_public_key,
             esp,
             generation_links,
         }
@@ -83,6 +90,8 @@ impl InstallerBuilder {
             configuration_limit: self.configuration_limit,
             bootcounting_initial_tries: self.bootcounting_initial_tries,
             pcrlock_paths,
+            pcr_private_key: self.pcr_private_key,
+            pcr_public_key: self.pcr_public_key,
             esp_paths,
             generation_links: self.generation_links,
             arch: self.arch,
@@ -100,6 +109,8 @@ pub struct Installer<S: Signer> {
     configuration_limit: usize,
     bootcounting_initial_tries: u32,
     pcrlock_paths: Option<PcrlockPaths>,
+    pcr_private_key: Option<PathBuf>,
+    pcr_public_key: Option<PathBuf>,
     esp_paths: SystemdEspPaths,
     generation_links: Vec<PathBuf>,
     arch: Architecture,
@@ -296,7 +307,18 @@ impl<S: Signer> Installer<S> {
         let kernel_cmdline =
             assemble_kernel_cmdline(&bootspec.init, bootspec.kernel_params.clone());
 
-        let parameters = pe::StubParameters::new(
+        // This must happen AFTER append_initrd_secrets (which modifies
+        // initrd_location in place) and BEFORE StubParameters (which embeds
+        // the signature).
+        let pcr_signing_data = self.sign_pcr_predictions(
+            &tempdir,
+            &bootspec.kernel,
+            &initrd_location,
+            &kernel_cmdline,
+            &os_release_contents,
+        )?;
+
+        let mut parameters = pe::StubParameters::new(
             &self.lanzaboote_stub,
             &bootspec.kernel,
             &initrd_location,
@@ -306,6 +328,10 @@ impl<S: Signer> Installer<S> {
         )?
         .with_cmdline(&kernel_cmdline)
         .with_os_release_contents(os_release_contents.as_bytes());
+
+        if let Some((pcrsig, pcrpkey)) = pcr_signing_data {
+            parameters = parameters.with_pcr_signature(pcrsig, pcrpkey);
+        }
 
         let lanzaboote_image_path = lanzaboote_image(&tempdir, &parameters)
             .context("Failed to build and sign lanzaboote stub image.")?;
@@ -319,8 +345,13 @@ impl<S: Signer> Installer<S> {
         }
 
         let stub_target = self.esp_paths.linux.join(
-            stub_name(generation, &self.signer, self.bootcounting_initial_tries)
-                .context("Get stub name")?,
+            stub_name(
+                generation,
+                &self.signer,
+                self.bootcounting_initial_tries,
+                self.pcr_public_key.as_deref(),
+            )
+            .context("Get stub name")?,
         );
         self.gc_roots.extend([&stub_target]);
         install_signed(&self.signer, &lanzaboote_image_path, &stub_target)
@@ -342,7 +373,11 @@ impl<S: Signer> Installer<S> {
         // See https://uapi-group.org/specifications/specs/boot_loader_specification/#boot-counting
         let pattern = format!(
             r"^{}(\+\d+(-\d+)?)?\.efi$",
-            regex::escape(&stub_prefix(generation, &self.signer)?)
+            regex::escape(&stub_prefix(
+                generation,
+                &self.signer,
+                self.pcr_public_key.as_deref()
+            )?)
         );
         let regex =
             Regex::new(&pattern).context("Failed to construct regex to read stubs from ESP")?;
@@ -517,6 +552,64 @@ impl<S: Signer> Installer<S> {
 
         Ok(())
     }
+
+    /// Sign PCR 11 predictions using systemd-measure sign.
+    ///
+    /// Returns the pcrsig JSON and pcrpkey data if PCR signing keys are configured,
+    /// or None if signing is not enabled.
+    fn sign_pcr_predictions(
+        &self,
+        tempdir: &TempDir,
+        kernel_path: &Path,
+        initrd_path: &Path,
+        kernel_cmdline: &[String],
+        os_release_contents: &str,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let (pcr_private_key, pcr_public_key) = match (&self.pcr_private_key, &self.pcr_public_key)
+        {
+            (Some(private), Some(public)) => (private, public),
+            (None, None) => return Ok(None),
+            _ => {
+                anyhow::bail!(
+                    "Both --pcr-private-key and --pcr-public-key must be provided together."
+                );
+            }
+        };
+
+        log::info!("Signing PCR 11 predictions...");
+
+        let os_release_file =
+            tempdir.write_secure_file(os_release_contents)?;
+        let cmdline_file =
+            tempdir.write_secure_file(kernel_cmdline.join(" "))?;
+
+        let systemd_measure = self.systemd.join("lib/systemd/systemd-measure");
+
+        let output = Command::new(&systemd_measure)
+            .arg("sign")
+            .arg(format!("--linux={}", kernel_path.display()))
+            .arg(format!("--initrd={}", initrd_path.display()))
+            .arg(format!("--osrel={}", os_release_file.display()))
+            .arg(format!("--cmdline={}", cmdline_file.display()))
+            .arg(format!("--pcrpkey={}", pcr_public_key.display()))
+            .arg(format!("--public-key={}", pcr_public_key.display()))
+            .arg(format!("--private-key={}", pcr_private_key.display()))
+            .arg("--json=short")
+            .output()
+            .context("Failed to run systemd-measure sign.")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("systemd-measure sign failed: {}", stderr);
+        }
+
+        let pcrsig_data = output.stdout;
+        let pcrpkey_data =
+            fs::read(pcr_public_key).context("Failed to read PCR public key file.")?;
+
+        log::info!("PCR 11 predictions signed successfully.");
+        Ok(Some((pcrsig_data, pcrpkey_data)))
+    }
 }
 
 /// Translate an EFI path to an absolute path on the mounted ESP.
@@ -531,8 +624,9 @@ fn stub_name<S: Signer>(
     generation: &Generation,
     signer: &S,
     bootcounting_tries: u32,
+    pcr_public_key: Option<&Path>,
 ) -> Result<PathBuf> {
-    stub_prefix(generation, signer).map(|prefix| {
+    stub_prefix(generation, signer, pcr_public_key).map(|prefix| {
         PathBuf::from(if bootcounting_tries > 0 {
             format!("{}+{}.efi", prefix, bootcounting_tries)
         } else {
@@ -541,9 +635,17 @@ fn stub_name<S: Signer>(
     })
 }
 
-fn stub_prefix<S: Signer>(generation: &Generation, signer: &S) -> Result<String> {
+fn stub_prefix<S: Signer>(
+    generation: &Generation,
+    signer: &S,
+    pcr_public_key: Option<&Path>,
+) -> Result<String> {
     let bootspec = &generation.spec.bootspec.bootspec;
     let public_key = signer.get_public_key()?;
+    let pcr_pkey_hash = match pcr_public_key {
+        Some(path) => file_hash(path).context("Failed to hash PCR public key file.")?.to_vec(),
+        None => Vec::new(),
+    };
     let stub_inputs = [
         // Generation numbers can be reused if the latest generation was deleted.
         // To detect this, the stub path depends on the actual toplevel used.
@@ -551,6 +653,9 @@ fn stub_prefix<S: Signer>(generation: &Generation, signer: &S) -> Result<String>
         // If the key is rotated, the signed stubs must be re-generated.
         // So we make their path depend on the public key used for signature.
         ("public_key", &public_key),
+        // PCR signing key rotation also requires stub re-generation, since
+        // the .pcrsig and .pcrpkey PE sections change.
+        ("pcr_public_key", &pcr_pkey_hash),
     ];
     let stub_input_hash = Base32Unpadded::encode_string(&Sha256::digest(
         serde_json::to_string(&stub_inputs).unwrap(),

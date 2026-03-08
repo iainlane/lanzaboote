@@ -275,6 +275,7 @@ pub fn image_path(esp: &TempDir, version: u64, toplevel: &Path) -> Result<PathBu
             "public_key",
             &std::fs::read("tests/fixtures/uefi-keys/db.pem")?,
         ),
+        ("pcr_public_key", &Vec::new()),
     ];
     let stub_input_hash = Base32Unpadded::encode_string(&Sha256::digest(
         serde_json::to_string(&stub_inputs).unwrap(),

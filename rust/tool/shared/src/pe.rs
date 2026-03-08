@@ -25,6 +25,10 @@ pub struct StubParameters {
     pub kernel_path_at_esp: String,
     /// Same as kernel.
     pub initrd_path_at_esp: String,
+    /// Signed PCR 11 predictions (JSON output from systemd-measure sign).
+    pub pcrsig_data: Option<Vec<u8>>,
+    /// Public key for PCR 11 signature verification (PEM).
+    pub pcrpkey_data: Option<Vec<u8>>,
 }
 
 impl StubParameters {
@@ -48,6 +52,8 @@ impl StubParameters {
             initrd_path_at_esp: esp_relative_uefi_path(esp, initrd_target)?,
             kernel_cmdline: Vec::new(),
             os_release_contents: Vec::new(),
+            pcrsig_data: None,
+            pcrpkey_data: None,
         })
     }
 
@@ -58,6 +64,12 @@ impl StubParameters {
 
     pub fn with_cmdline(mut self, cmdline: &[String]) -> Self {
         self.kernel_cmdline = cmdline.to_vec();
+        self
+    }
+
+    pub fn with_pcr_signature(mut self, pcrsig: Vec<u8>, pcrpkey: Vec<u8>) -> Self {
+        self.pcrsig_data = Some(pcrsig);
+        self.pcrpkey_data = Some(pcrpkey);
         self
     }
 }
@@ -113,14 +125,30 @@ pub fn lanzaboote_image(
     let initrd_hash_offs = kernel_path_offs + file_size(&kernel_path_file)?;
     let kernel_hash_offs = initrd_hash_offs + file_size(&initrd_hash_file)?;
 
-    let sections = vec![
+    let mut sections = vec![
         s(".osrel", os_release, os_release_offs),
         s(".cmdline", kernel_cmdline_file, kernel_cmdline_offs),
         s(".initrd", initrd_path_file, initrd_path_offs),
         s(".linux", kernel_path_file, kernel_path_offs),
         s(".initrdh", initrd_hash_file, initrd_hash_offs),
-        s(".linuxh", kernel_hash_file, kernel_hash_offs),
+        s(".linuxh", &kernel_hash_file, kernel_hash_offs),
     ];
+
+    let mut next_offs = kernel_hash_offs + file_size(&kernel_hash_file)?;
+
+    if let (Some(pcrsig), Some(pcrpkey)) = (
+        &stub_parameters.pcrsig_data,
+        &stub_parameters.pcrpkey_data,
+    ) {
+        let pcrsig_file = tempdir.write_secure_file(pcrsig)?;
+        let pcrpkey_file = tempdir.write_secure_file(pcrpkey)?;
+        let pcrsig_offs = next_offs;
+        let pcrpkey_offs = pcrsig_offs + file_size(&pcrsig_file)?;
+        sections.push(s(".pcrsig", pcrsig_file, pcrsig_offs));
+        sections.push(s(".pcrpkey", &pcrpkey_file, pcrpkey_offs));
+        next_offs = pcrpkey_offs + file_size(&pcrpkey_file)?;
+    }
+    let _ = next_offs;
 
     let image_path = tempdir.path().join(tmpname());
     wrap_in_pe(

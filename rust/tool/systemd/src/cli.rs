@@ -68,6 +68,14 @@ struct InstallCommand {
     #[arg(long)]
     pcrlock_directory: Option<PathBuf>,
 
+    /// Private key for signing PCR 11 predictions (via systemd-measure sign)
+    #[arg(long)]
+    pcr_private_key: Option<PathBuf>,
+
+    /// Public key for PCR 11 signature verification
+    #[arg(long)]
+    pcr_public_key: Option<PathBuf>,
+
     /// EFI system partition mountpoint (e.g. efiSysMountPoint)
     esp: PathBuf,
 
@@ -115,6 +123,8 @@ fn install(args: InstallCommand) -> Result<()> {
         args.configuration_limit,
         args.bootcounting_initial_tries,
         args.pcrlock_directory,
+        args.pcr_private_key,
+        args.pcr_public_key,
         args.esp,
         args.generations,
     );
