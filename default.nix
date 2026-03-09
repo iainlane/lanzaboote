@@ -61,6 +61,12 @@ rec {
         inherit pkgs;
         extraBaseModules = {
           inherit (nixosModules) lanzaboote;
+          measuredBootTpm2 = {
+            disabledModules = [ "system/boot/systemd/tpm2.nix" ];
+            imports = [
+              "${sources.nixpkgs-measured-boot}/nixos/modules/system/boot/systemd/tpm2.nix"
+            ];
+          };
         };
       }
     );

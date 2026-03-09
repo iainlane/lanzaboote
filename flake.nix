@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs-measured-boot.url = "github:iainlane/nixpkgs/measured-boot";
 
     # Not used in the flake itself. Only used to make the source available for
     # the project.
@@ -25,6 +26,7 @@
     {
       self,
       nixpkgs,
+      nixpkgs-measured-boot,
       crane,
       rust-overlay,
       ...
@@ -44,6 +46,17 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+        in
+        import ./. {
+          inherit system pkgs rust-overlay;
+          crane = crane.mkLib pkgs;
+        }
+      );
+
+      lanzabooteMeasuredBoot = eachSystem (
+        system:
+        let
+          pkgs = nixpkgs-measured-boot.legacyPackages.${system};
         in
         import ./. {
           inherit system pkgs rust-overlay;
@@ -79,6 +92,7 @@
         system:
         let
           checks = lanzaboote.${system}.checks;
+          measuredBootChecks = lanzabooteMeasuredBoot.${system}.checks;
         in
         {
           tool = checks.stub.package;
@@ -94,7 +108,19 @@
 
           inherit (checks) pre-commit;
         }
-        // builtins.removeAttrs checks.tests [ "recurseForDerivations" ]
+        // builtins.removeAttrs checks.tests [
+          "recurseForDerivations"
+          "luks-tpm2-combined"
+          "pcrlock"
+          "pcrlock-rollforward"
+        ]
+        // {
+          inherit (measuredBootChecks.tests)
+            luks-tpm2-combined
+            pcrlock
+            pcrlock-rollforward
+            ;
+        }
       );
 
     };
