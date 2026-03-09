@@ -288,6 +288,16 @@ in
       };
     };
 
+    fwupd = {
+      autoUnlockFirmwareCode = lib.mkEnableOption "" // {
+        description = ''
+          Whether to automatically relax the pcrlock firmware-code component
+          when fwupd stages a UEFI capsule update.
+        '';
+        default = true;
+      };
+    };
+
     installCommand = lib.mkOption {
       type = lib.types.str;
       readOnly = true;
@@ -719,6 +729,41 @@ in
         ln -sf ${config.services.fwupd.package.fwupd-efi}/libexec/fwupd/efi/fwupd*.efi /run/fwupd-efi/
         ${lib.getExe' pkgs.sbsigntool "sbsign"} --key '${cfg.privateKeyFile}' --cert '${cfg.publicKeyFile}' /run/fwupd-efi/fwupd*.efi
       '';
+    };
+
+    systemd.services.fwupd-pcrlock-unlock-firmware-code = lib.mkIf (
+      config.services.fwupd.enable
+      && config.systemd.pcrlock.enable
+      && cfg.fwupd.autoUnlockFirmwareCode
+    ) {
+      description = "Relax pcrlock firmware-code policy for fwupd-staged capsule updates";
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = [
+          "${config.systemd.package}/lib/systemd/systemd-pcrlock unlock-firmware-code"
+          "${config.systemd.package}/lib/systemd/systemd-pcrlock make-policy --recovery-pin=no"
+        ];
+      };
+      unitConfig = {
+        ConditionPathExistsGlob = "/sys/firmware/efi/efivars/fwupd-*-0abba7dc-e516-4167-bbf5-4d9d1c739416";
+        ConditionPathExists = [
+          "/var/lib/pcrlock.d/250-firmware-code-early.pcrlock.d/generated.pcrlock"
+          "/var/lib/pcrlock.d/550-firmware-code-late.pcrlock.d/generated.pcrlock"
+        ];
+      };
+    };
+
+    systemd.paths.fwupd-pcrlock-unlock-firmware-code = lib.mkIf (
+      config.services.fwupd.enable
+      && config.systemd.pcrlock.enable
+      && cfg.fwupd.autoUnlockFirmwareCode
+    ) {
+      description = "Watch for fwupd-staged capsule updates that require pcrlock firmware-code unlock";
+      wantedBy = [ "multi-user.target" ];
+      pathConfig = {
+        PathExistsGlob = "/sys/firmware/efi/efivars/fwupd-*-0abba7dc-e516-4167-bbf5-4d9d1c739416";
+        Unit = "fwupd-pcrlock-unlock-firmware-code.service";
+      };
     };
 
     services.fwupd.uefiCapsuleSettings = lib.mkIf config.services.fwupd.enable {
