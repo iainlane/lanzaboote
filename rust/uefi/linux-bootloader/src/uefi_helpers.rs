@@ -62,16 +62,27 @@ pub fn booted_image_file() -> Result<PeInMemory> {
     })
 }
 
+/// How a PE binary's bytes are laid out in the buffer being parsed.
+///
+/// Sections of an image that the firmware loaded live at their virtual
+/// addresses, while sections of a file read from disk live at their raw
+/// file offsets. Extracting section data with the wrong layout reads
+/// unrelated bytes or runs out of bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeLayout {
+    Loaded,
+    Disk,
+}
+
 /// An analyzed PE
 pub struct ParsedPe<'a> {
     data: &'a [u8],
     parsed: PE<'a>,
+    layout: PeLayout,
 }
 
 impl<'a> ParsedPe<'a> {
-    /// Parse a slice of data into a goblin PE structure.
-    ///
-    /// In-memory PE binaries need to be parsed differently from those read from disk.
+    /// Parse the currently running image.
     pub fn from_pe_in_memory(pe_in_memory: &PeInMemory) -> uefi::Result<Self> {
         // SAFETY: We get a slice that represents our currently running
         // image and then parse the PE data structures from it. This is
@@ -80,13 +91,36 @@ impl<'a> ParsedPe<'a> {
         // (data sections := all unified sections that can be measured.)
         let data = unsafe { pe_in_memory.as_slice() };
 
+        Self::parse(data, PeLayout::Loaded)
+    }
+
+    /// Parse a PE image that the firmware loaded into memory, e.g. an addon
+    /// verified and loaded via LoadImage.
+    pub fn from_loaded_data(data: &'a [u8]) -> uefi::Result<Self> {
+        Self::parse(data, PeLayout::Loaded)
+    }
+
+    /// Parse a PE binary in its on-disk representation, e.g. a file read
+    /// straight from the ESP.
+    pub fn from_disk_data(data: &'a [u8]) -> uefi::Result<Self> {
+        Self::parse(data, PeLayout::Disk)
+    }
+
+    fn parse(data: &'a [u8], layout: PeLayout) -> uefi::Result<Self> {
         let mut parse_options = ParseOptions::default();
-        // Don't parse the certificates because they are not present in the in-memory representation.
+        // Don't parse attribute certificates: they are not mapped in loaded
+        // images (the security directory points at file offsets), and addons
+        // don't need them parsed either, since signature verification happens
+        // via LoadImage or the shim protocol before we ever look at sections.
         parse_options.parse_attribute_certificates = false;
         let parsed = goblin::pe::PE::parse_with_opts(data, &parse_options)
             .map_err(|_| uefi::Status::INVALID_PARAMETER)?;
 
-        Ok(Self { data, parsed })
+        Ok(Self {
+            data,
+            parsed,
+            layout,
+        })
     }
 
     /// Extracts the data of a section of a loaded PE file based on the section name.
@@ -95,7 +129,7 @@ impl<'a> ParsedPe<'a> {
             .sections
             .iter()
             .find(|s| s.name().map(|n| n == section_name).unwrap_or(false))
-            .and_then(|s| read_data_from_section_table(self.data, s))
+            .and_then(|s| read_data_from_section_table(self.data, s, self.layout))
     }
 
     /// Iterator over all section names of the PE.
@@ -104,17 +138,27 @@ impl<'a> ParsedPe<'a> {
     }
 }
 
-/// Extracts the data of a section in a loaded PE file based on the section table.
-fn read_data_from_section_table(pe_data: &[u8], section: &SectionTable) -> Option<Vec<u8>> {
-    let section_start: usize = section.virtual_address.try_into().ok()?;
+/// Extracts the data of a section in a PE binary based on the section table.
+fn read_data_from_section_table(
+    pe_data: &[u8],
+    section: &SectionTable,
+    layout: PeLayout,
+) -> Option<Vec<u8>> {
+    let section_start: usize = match layout {
+        PeLayout::Loaded => section.virtual_address,
+        PeLayout::Disk => section.pointer_to_raw_data,
+    }
+    .try_into()
+    .ok()?;
 
     // virtual_size can be larger than size_of_raw_data when
     // zero-padding is required. virtual_size can also be smaller due
     // to alignment requirements in the file.
-    let section_data_end: usize = section_start
-        + usize::try_from(min(section.virtual_size, section.size_of_raw_data)).ok()?;
+    let stored_len: usize =
+        usize::try_from(min(section.virtual_size, section.size_of_raw_data)).ok()?;
+    let section_data_end = section_start.checked_add(stored_len)?;
 
-    let mut section_data = pe_data[section_start..section_data_end].to_owned();
+    let mut section_data = pe_data.get(section_start..section_data_end)?.to_owned();
     section_data.resize(section.virtual_size.try_into().ok()?, 0);
 
     Some(section_data)

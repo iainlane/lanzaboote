@@ -109,6 +109,8 @@ bitflags! {
        const ThreePcrs = 1 << 3;
        /// Can we pass a random seed to the kernel?
        const RandomSeed = 1 << 4;
+       /// Are .cmdline sections picked up from addon PE files?
+       const CmdlineAddons = 1 << 5;
        /// Are configuration extensions picked up from the boot partition?
        const PickUpConfExts = 1 << 8;
        /// Are `StubDevicePartUUID` and `StubImageIdentifier` loaded in UEFI variables?
@@ -175,6 +177,7 @@ pub fn export_efi_variables(stub_info_name: &str) -> Result<()> {
         | EfiStubFeatures::PickUpCredentials
         | EfiStubFeatures::PickUpSysExts
         | EfiStubFeatures::ThreePcrs
+        | EfiStubFeatures::CmdlineAddons
         | EfiStubFeatures::PickUpConfExts
         | EfiStubFeatures::ReportStubPartition;
 

@@ -1,6 +1,5 @@
-use crate::common::{boot_linux_unchecked, get_cmdline, get_secure_boot_status};
-use alloc::{string::String, vec::Vec};
-use linux_bootloader::measure::measure_load_options;
+use crate::common::{boot_linux_unchecked, get_secure_boot_status};
+use alloc::{format, string::String, vec::Vec};
 use linux_bootloader::uefi_helpers::{ParsedPe, PeInMemory};
 use log::{error, warn};
 use sha2::{Digest, Sha256};
@@ -59,11 +58,10 @@ impl UkiComponents {
             .expect("Failed to get file system handle");
         let mut file_system = FileSystem::new(file_system);
 
-        let (kernel_data, initrd_data);
-        kernel_data = file_system
+        let kernel_data = file_system
             .read(&*kernel_filename)
             .expect("Failed to read kernel file into memory");
-        initrd_data = file_system
+        let initrd_data = file_system
             .read(&*initrd_filename)
             .expect("Failed to read initrd file into memory");
 
@@ -99,30 +97,31 @@ pub fn boot_linux(
     handle: Handle,
     components: UkiComponents,
     dynamic_initrds: Vec<Vec<u8>>,
+    cmdline: Vec<u8>,
+    addon_cmdline: Option<&str>,
 ) -> uefi::Result<()> {
-    let cmdline = get_cmdline(&components.cmdline);
+    let mut cmdline = cmdline;
+
+    if let Some(extra) = addon_cmdline {
+        let suffix = format!(" {}", extra);
+        let suffix_bytes: Vec<u8> = suffix
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        if cmdline.len() >= 2 && cmdline[cmdline.len() - 2..] == [0, 0] {
+            cmdline.truncate(cmdline.len() - 2);
+        }
+        cmdline.extend_from_slice(&suffix_bytes);
+        cmdline.extend_from_slice(&[0, 0]);
+    }
 
     let mut initrd_data = components.initrd_data;
 
-    // Correctness: dynamic initrds are supposed to be validated by caller,
-    // i.e. they are system extension images or credentials
-    // that are supposedly measured in TPM2.
-    // Therefore, it is normal to not verify their hashes against a configuration.
-
-    // Pad to align
     initrd_data.resize(initrd_data.len().next_multiple_of(4), 0);
     for mut extra_initrd in dynamic_initrds {
-        // Uncomment for maximal debugging pleasure.
-        // let debug_representation = extra_initrd.as_slice().escape_ascii().collect::<Vec<u8>>();
-        // log::warn!("{:?}", String::from_utf8_lossy(&debug_representation));
         initrd_data.append(&mut extra_initrd);
-        // Extra initrds ideally should be aligned, but just in case, let's verify this.
         initrd_data.resize(initrd_data.len().next_multiple_of(4), 0);
     }
 
-    if cmdline.should_measure_in_pcr12 {
-        let _ = measure_load_options(&cmdline.bytes);
-    }
-
-    boot_linux_unchecked(handle, components.kernel_data, &cmdline.bytes, initrd_data)
+    boot_linux_unchecked(handle, components.kernel_data, &cmdline, initrd_data)
 }

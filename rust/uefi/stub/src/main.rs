@@ -8,17 +8,20 @@ mod common;
 mod thin;
 
 use crate::thin::UkiComponents;
-use alloc::vec::Vec;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
+use linux_bootloader::addons::{discover_cmdline_addons, encode_cmdline_utf16};
 use linux_bootloader::companions::{
     discover_configuration_extensions, discover_credentials, discover_system_extensions,
     get_default_dropin_directory,
 };
 use linux_bootloader::cpio::pack_cpio_literal;
 use linux_bootloader::efivars::{EfiLoaderFeatures, export_efi_variables, get_loader_features};
-use linux_bootloader::measure::{measure_companion_initrds, measure_image};
-use linux_bootloader::pe_section::pe_section;
+use linux_bootloader::measure::{measure_companion_initrds, measure_image, measure_load_options};
 use linux_bootloader::tpm::tpm_available;
-use linux_bootloader::uefi_helpers::booted_image_file;
+use linux_bootloader::uefi_helpers::{ParsedPe, booted_image_file};
 use log::{info, warn};
 use uefi::boot;
 use uefi::prelude::*;
@@ -48,6 +51,7 @@ fn main() -> Status {
     print_logo();
 
     let is_tpm_available = tpm_available();
+    let secure_boot_enabled = crate::common::get_secure_boot_status();
     let pe_in_memory = booted_image_file()
         .expect("Failed to extract the in-memory information about our own image");
 
@@ -70,14 +74,22 @@ fn main() -> Status {
     if let Ok(features) = get_loader_features()
         && !features.contains(EfiLoaderFeatures::RandomSeed)
     {
-        // FIXME: process random seed then on the disk.
-        info!("Random seed is available, but lanzaboote does not support it yet.");
+        // FIXME: read the random seed from the ESP and pass it to the kernel.
+        info!("The boot loader does not handle the random seed, and lanzaboote does not support passing it yet.");
     }
 
     if export_efi_variables(STUB_NAME).is_err() {
         warn!(
             "Failed to export stub EFI variables, some features related to measured boot will not be available"
         );
+    }
+
+    // Resolve the kernel command line that will be used for booting, and
+    // measure a custom one into PCR 12 before any addon measurements so the
+    // event order is: load options, then addons.
+    let resolved_cmdline = crate::common::get_cmdline(&components.cmdline);
+    if resolved_cmdline.should_measure_in_pcr12 && is_tpm_available {
+        let _ = measure_load_options(&resolved_cmdline.bytes);
     }
 
     // A list of dynamically assembled initrds, e.g. credential initrds or system extension
@@ -88,14 +100,15 @@ fn main() -> Status {
     // CPIO archives in the initrd. These are NOT measured as companions — .pcrsig
     // is excluded from measurement per spec, and .pcrpkey is already measured as a
     // PE section during measure_image().
-    //
-    // SAFETY: pe_in_memory is our own loaded PE image and is not concurrently mutated.
-    let pe_data = unsafe { pe_in_memory.as_slice() };
-    let pcrsig_data = pe_section(pe_data, ".pcrsig");
-    let pcrpkey_data = pe_section(pe_data, ".pcrpkey");
+    let parsed_pe =
+        ParsedPe::from_pe_in_memory(&pe_in_memory).expect("Failed to parse our own PE image");
+    let pcrsig_data = parsed_pe.section_data(".pcrsig");
+    let pcrpkey_data = parsed_pe.section_data(".pcrpkey");
 
     if pcrsig_data.is_some() != pcrpkey_data.is_some() {
-        warn!("Only one of .pcrsig/.pcrpkey found in PE — PCR signature verification will not work");
+        warn!(
+            "Only one of .pcrsig/.pcrpkey found in PE — PCR signature verification will not work"
+        );
     }
 
     if let Some(pcrsig_data) = pcrsig_data {
@@ -125,6 +138,12 @@ fn main() -> Status {
             Err(e) => warn!("Failed to pack .pcrpkey into CPIO archive: {:?}", e),
         }
     }
+
+    let mut addon_cmdline: Option<alloc::string::String> = None;
+    let uki_uname = parsed_pe
+        .section_data(".uname")
+        .and_then(|data| String::from_utf8(data).ok())
+        .map(|uname| uname.trim_end_matches('\0').to_string());
 
     {
         // This is a block for doing filesystem operations once and for all, related to companion
@@ -164,12 +183,48 @@ fn main() -> Status {
                 warn!("Failed to discover any system extension");
             }
 
-            if let Ok(mut confexts) =
-                discover_configuration_extensions(&mut filesystem, dropin_ref)
+            if let Ok(mut confexts) = discover_configuration_extensions(&mut filesystem, dropin_ref)
             {
                 companions.append(&mut confexts);
             } else {
                 warn!("Failed to discover any configuration extension");
+            }
+
+            // Discover .cmdline addons from addon PE files.
+            if let Ok(addons) = discover_cmdline_addons(
+                &mut filesystem,
+                dropin_ref,
+                uki_uname.as_deref(),
+                secure_boot_enabled,
+            ) {
+                if !addons.is_empty() {
+                    let combined: alloc::string::String = addons
+                        .iter()
+                        .map(|a| a.cmdline.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    info!("Addon command line: {}", combined);
+
+                    // The addon command line is input to the boot, so it must
+                    // be measured before use. Refuse it entirely if it cannot
+                    // be encoded for measurement.
+                    match encode_cmdline_utf16(&combined) {
+                        Ok(addon_cmdline_utf16) => {
+                            if is_tpm_available {
+                                let _ = measure_load_options(addon_cmdline_utf16.as_bytes());
+                            }
+                            addon_cmdline = Some(combined);
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Ignoring addon command line that cannot be encoded for measurement: {err:?}"
+                            );
+                        }
+                    }
+                }
+            } else {
+                warn!("Failed to discover command line addons");
             }
 
             if is_tpm_available {
@@ -191,5 +246,12 @@ fn main() -> Status {
         }
     }
 
-    thin::boot_linux(boot::image_handle(), components, dynamic_initrds).status()
+    thin::boot_linux(
+        boot::image_handle(),
+        components,
+        dynamic_initrds,
+        resolved_cmdline.bytes,
+        addon_cmdline.as_deref(),
+    )
+    .status()
 }

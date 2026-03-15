@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod addons;
 pub mod companions;
 pub mod cpio;
 pub mod efivars;

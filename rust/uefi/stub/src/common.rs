@@ -20,8 +20,7 @@ pub struct ResolvedCmdline {
 ///
 /// If we read a user provided cmdline, we measure it into PCR4 to invalidate the PCR. This way we
 /// can support Measured Boot without Secure Boot while still giving users the option to edit the
-/// kernel cmdline on the fly for debugging. The caller additionally measures it into PCR12, like
-/// systemd-stub does for custom load options.
+/// kernel cmdline on the fly for debugging. The caller additionally measures it into PCR12.
 pub fn get_cmdline(embedded: &CStr16) -> ResolvedCmdline {
     let secure_boot_enabled = get_secure_boot_status();
     if !secure_boot_enabled {

@@ -22,6 +22,7 @@ in
   hash-mismatch-kernel-sb = runTest ./lanzaboote/hash-mismatch-kernel-sb.nix;
   specialisation = runTest ./lanzaboote/specialisation.nix;
   systemd-boot-loader-config = runTest ./lanzaboote/systemd-boot-loader-config.nix;
+  cmdline-addons = runTest ./lanzaboote/cmdline-addons.nix;
   confext = runTest ./lanzaboote/confext.nix;
   export-efivars = runTest ./lanzaboote/export-efivars.nix;
   export-efivars-tpm = runTest ./lanzaboote/export-efivars-tpm.nix;
