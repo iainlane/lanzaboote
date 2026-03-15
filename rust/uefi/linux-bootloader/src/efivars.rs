@@ -109,6 +109,8 @@ bitflags! {
        const ThreePcrs = 1 << 3;
        /// Can we pass a random seed to the kernel?
        const RandomSeed = 1 << 4;
+       /// Are `StubDevicePartUUID` and `StubImageIdentifier` loaded in UEFI variables?
+       const ReportStubPartition = 1 << 10;
     }
 }
 
@@ -159,74 +161,82 @@ where
     Ok(())
 }
 
+fn encode_utf16le(s: &str) -> Vec<u8> {
+    s.encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect::<Vec<u8>>()
+}
+
 /// Exports systemd-stub style EFI variables
 pub fn export_efi_variables(stub_info_name: &str) -> Result<()> {
     let stub_features: EfiStubFeatures = EfiStubFeatures::ReportBootPartition
         | EfiStubFeatures::PickUpCredentials
         | EfiStubFeatures::PickUpSysExts
-        | EfiStubFeatures::ThreePcrs;
+        | EfiStubFeatures::ThreePcrs
+        | EfiStubFeatures::ReportStubPartition;
 
     let loaded_image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())?;
 
     let default_attributes =
         VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS;
 
-    #[allow(unused_must_use)]
-    // LoaderDevicePartUUID
-    ensure_efi_variable(
-        cstr16!("LoaderDevicePartUUID"),
-        &BOOT_LOADER_VENDOR_UUID,
-        default_attributes,
-        || {
-            disk_get_part_uuid(loaded_image.device().ok_or(uefi::Status::NOT_FOUND)?).map(|guid| {
-                guid.to_string()
-                    .encode_utf16()
-                    .flat_map(|c| c.to_le_bytes())
-                    .collect::<Vec<u8>>()
-            })
-        },
-    )
-    .ok();
-    // LoaderImageIdentifier
-    ensure_efi_variable(
-        cstr16!("LoaderImageIdentifier"),
-        &BOOT_LOADER_VENDOR_UUID,
-        default_attributes,
-        || {
-            if let Some(dp) = loaded_image.file_path() {
-                let dp_protocol = boot::open_protocol_exclusive::<DevicePathToText>(
-                    boot::get_handle_for_protocol::<DevicePathToText>()?,
-                )?;
-                dp_protocol
-                    .convert_device_path_to_text(
-                        dp,
-                        uefi::proto::device_path::text::DisplayOnly(false),
-                        uefi::proto::device_path::text::AllowShortcuts(false),
-                    )
-                    .map(|ps| cstr16_to_bytes(&ps).to_vec())
-            } else {
-                // If we cannot retrieve the filepath of the loaded image
-                // Then, we cannot set `LoaderImageIdentifier`.
-                Err(uefi::Status::UNSUPPORTED.into())
-            }
-        },
-    )
-    .ok();
+    // Compute partition UUID and image identifier eagerly so they can be reused
+    // for both the Loader* (conditional, may already be set by the boot loader)
+    // and Stub* (unconditional, always owned by the stub) variables.
+    let part_uuid_bytes: Option<Vec<u8>> = loaded_image
+        .device()
+        .and_then(|device| disk_get_part_uuid(device).ok())
+        .map(|guid| encode_utf16le(&guid.to_string()));
+
+    let image_id_bytes: Option<Vec<u8>> = loaded_image.file_path().and_then(|dp| {
+        let dp_protocol = boot::open_protocol_exclusive::<DevicePathToText>(
+            boot::get_handle_for_protocol::<DevicePathToText>().ok()?,
+        )
+        .ok()?;
+        dp_protocol
+            .convert_device_path_to_text(
+                dp,
+                uefi::proto::device_path::text::DisplayOnly(false),
+                uefi::proto::device_path::text::AllowShortcuts(false),
+            )
+            .map(|ps| cstr16_to_bytes(&ps).to_vec())
+            .ok()
+    });
+
+    // LoaderDevicePartUUID — only set if the boot loader has not already set it.
+    if let Some(ref bytes) = part_uuid_bytes {
+        let b = bytes.clone();
+        ensure_efi_variable(
+            cstr16!("LoaderDevicePartUUID"),
+            &BOOT_LOADER_VENDOR_UUID,
+            default_attributes,
+            || Ok(b),
+        )
+        .ok();
+    }
+    // LoaderImageIdentifier — only set if the boot loader has not already set it.
+    if let Some(ref bytes) = image_id_bytes {
+        let b = bytes.clone();
+        ensure_efi_variable(
+            cstr16!("LoaderImageIdentifier"),
+            &BOOT_LOADER_VENDOR_UUID,
+            default_attributes,
+            || Ok(b),
+        )
+        .ok();
+    }
     // LoaderFirmwareInfo
     ensure_efi_variable(
         cstr16!("LoaderFirmwareInfo"),
         &BOOT_LOADER_VENDOR_UUID,
         default_attributes,
         || {
-            Ok(format!(
+            Ok(encode_utf16le(&format!(
                 "{} {}.{:02}",
                 system::firmware_vendor(),
                 system::firmware_revision() >> 16,
                 system::firmware_revision() & 0xFFFFF
-            )
-            .encode_utf16()
-            .flat_map(|c| c.to_le_bytes())
-            .collect::<Vec<u8>>())
+            )))
         },
     )
     .ok();
@@ -236,26 +246,45 @@ pub fn export_efi_variables(stub_info_name: &str) -> Result<()> {
         &BOOT_LOADER_VENDOR_UUID,
         default_attributes,
         || {
-            Ok(format!("UEFI {:02}", system::uefi_revision())
-                .encode_utf16()
-                .flat_map(|c| c.to_le_bytes())
-                .collect::<Vec<u8>>())
+            Ok(encode_utf16le(&format!(
+                "UEFI {:02}",
+                system::uefi_revision()
+            )))
         },
     )
     .ok();
-    // StubInfo
+
+    // StubInfo — always owned by the stub.
     // FIXME: ideally, no one should be able to overwrite `StubInfo`, but that would require
     // constructing an EFI authenticated variable payload. This seems overcomplicated for now.
     runtime::set_variable(
         cstr16!("StubInfo"),
         &BOOT_LOADER_VENDOR_UUID,
         default_attributes,
-        &stub_info_name
-            .encode_utf16()
-            .flat_map(|c| c.to_le_bytes())
-            .collect::<Vec<u8>>(),
+        &encode_utf16le(stub_info_name),
     )
     .ok();
+
+    // StubDevicePartUUID — always owned by the stub.
+    if let Some(ref bytes) = part_uuid_bytes {
+        runtime::set_variable(
+            cstr16!("StubDevicePartUUID"),
+            &BOOT_LOADER_VENDOR_UUID,
+            default_attributes,
+            bytes,
+        )
+        .ok();
+    }
+    // StubImageIdentifier — always owned by the stub.
+    if let Some(ref bytes) = image_id_bytes {
+        runtime::set_variable(
+            cstr16!("StubImageIdentifier"),
+            &BOOT_LOADER_VENDOR_UUID,
+            default_attributes,
+            bytes,
+        )
+        .ok();
+    }
 
     // StubFeatures
     runtime::set_variable(

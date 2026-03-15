@@ -53,7 +53,9 @@ in
         "LoaderFirmwareInfo",
         "LoaderFirmwareType",
         "StubInfo",
-        "StubFeatures"
+        "StubFeatures",
+        "StubDevicePartUUID",
+        "StubImageIdentifier"
       ]
 
       # Debug all systemd loader specification GUID EFI variables loaded by the current environment.
@@ -71,6 +73,10 @@ in
       # OVMF tests are using EDK II tree.
       assert_variable_string_contains("LoaderFirmwareInfo", "EDK II")
       assert_variable_string_contains("LoaderFirmwareType", "UEFI")
+
+      # Stub partition variables should match the Loader ones when booted directly.
+      assert_variable_string("StubDevicePartUUID", "a3c9c5a1-1a9a-451c-bdac-a80bacb4170b")
+      assert_variable_string("StubImageIdentifier", "\\EFI\\BOOT\\BOOT${efiArchUppercased}.EFI")
 
       with subtest("Is `StubFeatures` non-zero"):
           assert struct.unpack('<Q', read_raw_variable("StubFeatures")) != 0

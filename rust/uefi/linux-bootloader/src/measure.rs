@@ -38,12 +38,14 @@ pub fn measure_boot_loader(buffer: &[u8], description: &str) -> uefi::Result<()>
 }
 
 fn encode_pcr_index(pcr_index: PcrIndex) -> Vec<u8> {
-    pcr_index
+    let mut encoded = pcr_index
         .0
         .to_string()
         .encode_utf16()
         .flat_map(|c| c.to_le_bytes())
-        .collect::<Vec<u8>>()
+        .collect::<Vec<u8>>();
+    encoded.extend_from_slice(&[0, 0]);
+    encoded
 }
 
 fn set_stub_pcr_variable(name: &uefi::CStr16, pcr_index: PcrIndex) -> uefi::Result<()> {
