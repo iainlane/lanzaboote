@@ -25,11 +25,11 @@ const TPM_PCR_INDEX_BOOT_LOADER: PcrIndex = PcrIndex(4);
 /// 2. The (binary) section contents"
 ///
 /// Measurements are made in canonical order, interleaved: section name, section data, next section name, etc.
-const TPM_PCR_INDEX_KERNEL_IMAGE: PcrIndex = PcrIndex(11);
+pub const TPM_PCR_INDEX_KERNEL_IMAGE: PcrIndex = PcrIndex(11);
 /// This is where lanzastub extends the kernel command line and any passed credentials into
-const TPM_PCR_INDEX_KERNEL_CONFIG: PcrIndex = PcrIndex(12);
+pub const TPM_PCR_INDEX_KERNEL_CONFIG: PcrIndex = PcrIndex(12);
 /// This is where we extend the initrd sysext images into which we pass to the booted kernel
-const TPM_PCR_INDEX_SYSEXTS: PcrIndex = PcrIndex(13);
+pub const TPM_PCR_INDEX_SYSEXTS: PcrIndex = PcrIndex(13);
 
 /// Measure arbitrary data into PCR 4 via an IPL event.
 pub fn measure_boot_loader(buffer: &[u8], description: &str) -> uefi::Result<()> {
@@ -76,7 +76,7 @@ pub fn measure_image(
     let pe = ParsedPe::from_pe_in_memory(image)?;
     // Build a list of unified_sections and sort by canonical order.
     // Per UKI spec: "shall measure the sections listed above, starting from the .linux section,
-    // in the order as listed (which should be considered the canonical order)."
+    // in the order as listed (which should be considered the canonical order).
     let mut sections_to_measure = Vec::new();
     for section_name in pe.sections() {
         if let Ok(unified_section) = UnifiedSection::try_from(section_name) {
@@ -93,7 +93,6 @@ pub fn measure_image(
 
         let section_data = pe.section_data(section_name);
         let data = match unified_section {
-            // Use kernel/initrd data that were loaded from file system to match systemd-stub's measuring
             UnifiedSection::Linux => Some(kernel_data),
             UnifiedSection::Initrd => Some(initrd_data),
             _ => section_data.as_deref(),
@@ -102,8 +101,6 @@ pub fn measure_image(
         if let Some(data) = data {
             info!("Measuring section `{}`...", section_name);
 
-            // Per UKI spec: "For each section two measurements shall be made into PCR 11"
-            // 1. "The section name in ASCII (including one trailing NUL byte)"
             let section_name_ascii = alloc::format!("{}\0", section_name);
             if tpm_log_event_ascii(
                 TPM_PCR_INDEX_KERNEL_IMAGE,
@@ -116,15 +113,13 @@ pub fn measure_image(
             }
 
             // 2. "The (binary) section contents"
-            if tpm_log_event_ascii(TPM_PCR_INDEX_KERNEL_IMAGE, data, section_name).is_ok() {
+            if tpm_log_event_ascii(TPM_PCR_INDEX_KERNEL_IMAGE, data, section_name)? {
                 measurements += 1;
             }
         }
     }
 
     if measurements > 0 {
-        // If we did some measurements, expose a variable encoding the PCR where
-        // we have done the measurements.
         set_stub_pcr_variable(cstr16!("StubPcrKernelImage"), TPM_PCR_INDEX_KERNEL_IMAGE)?;
     }
 
@@ -162,69 +157,69 @@ pub fn measure_load_options(load_options: &[u8]) -> uefi::Result<bool> {
 /// A stable order is expected for measurement stability.
 pub fn measure_companion_initrds(companions: &[CompanionInitrd]) -> uefi::Result<u32> {
     let mut measurements = 0;
-    let mut credentials_measured = 0;
+    let mut kernel_config_measured = false;
     let mut sysext_measured = false;
+    let mut confext_measured = false;
 
     for initrd in companions {
-        match initrd.r#type {
-            CompanionInitrdType::PcrSignature | CompanionInitrdType::PcrPublicKey => {
-                continue;
-            }
-            CompanionInitrdType::Credentials => {
-                if tpm_log_event_ascii(
-                    TPM_PCR_INDEX_KERNEL_CONFIG,
-                    initrd.cpio.as_ref(),
-                    "Credentials initrd",
-                )
-                .is_ok()
-                {
-                    measurements += 1;
-                    credentials_measured += 1;
-                }
-            }
+        let (pcr, description) = match initrd.r#type {
+            CompanionInitrdType::PcrSignature | CompanionInitrdType::PcrPublicKey => continue,
+            CompanionInitrdType::Credentials => (TPM_PCR_INDEX_KERNEL_CONFIG, "Credentials initrd"),
             CompanionInitrdType::GlobalCredentials => {
-                if tpm_log_event_ascii(
-                    TPM_PCR_INDEX_KERNEL_CONFIG,
-                    initrd.cpio.as_ref(),
-                    "Global credentials initrd",
-                )
-                .is_ok()
-                {
-                    measurements += 1;
-                    credentials_measured += 1;
-                }
+                (TPM_PCR_INDEX_KERNEL_CONFIG, "Global credentials initrd")
             }
             CompanionInitrdType::SystemExtension => {
-                if tpm_log_event_ascii(
-                    TPM_PCR_INDEX_SYSEXTS,
-                    initrd.cpio.as_ref(),
-                    "System extension initrd",
-                )
-                .is_ok()
-                {
-                    measurements += 1;
-                    sysext_measured = true;
-                }
+                (TPM_PCR_INDEX_SYSEXTS, "System extension initrd")
             }
             CompanionInitrdType::GlobalSystemExtension => {
-                if tpm_log_event_ascii(
-                    TPM_PCR_INDEX_SYSEXTS,
-                    initrd.cpio.as_ref(),
-                    "Global system extension initrd",
-                )? {
-                    measurements += 1;
+                (TPM_PCR_INDEX_SYSEXTS, "Global system extension initrd")
+            }
+            CompanionInitrdType::ConfigurationExtension => (
+                TPM_PCR_INDEX_KERNEL_CONFIG,
+                "Configuration extension initrd",
+            ),
+            CompanionInitrdType::GlobalConfigurationExtension => (
+                TPM_PCR_INDEX_KERNEL_CONFIG,
+                "Global configuration extension initrd",
+            ),
+        };
+
+        if tpm_log_event_ascii(pcr, initrd.cpio.as_ref(), description)? {
+            measurements += 1;
+            match initrd.r#type {
+                CompanionInitrdType::Credentials | CompanionInitrdType::GlobalCredentials => {
+                    kernel_config_measured = true;
+                }
+                CompanionInitrdType::SystemExtension
+                | CompanionInitrdType::GlobalSystemExtension => {
                     sysext_measured = true;
                 }
+                CompanionInitrdType::ConfigurationExtension
+                | CompanionInitrdType::GlobalConfigurationExtension => {
+                    kernel_config_measured = true;
+                    confext_measured = true;
+                }
+                CompanionInitrdType::PcrSignature | CompanionInitrdType::PcrPublicKey => {}
             }
         }
     }
 
-    if credentials_measured > 0 {
-        set_stub_pcr_variable(cstr16!("StubPcrKernelParameters"), TPM_PCR_INDEX_KERNEL_CONFIG)?;
+    if kernel_config_measured {
+        set_stub_pcr_variable(
+            cstr16!("StubPcrKernelParameters"),
+            TPM_PCR_INDEX_KERNEL_CONFIG,
+        )?;
     }
 
     if sysext_measured {
         set_stub_pcr_variable(cstr16!("StubPcrInitRDSysExts"), TPM_PCR_INDEX_SYSEXTS)?;
+    }
+
+    if confext_measured {
+        set_stub_pcr_variable(
+            cstr16!("StubPcrInitRDConfExts"),
+            TPM_PCR_INDEX_KERNEL_CONFIG,
+        )?;
     }
 
     Ok(measurements)

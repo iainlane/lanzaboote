@@ -109,6 +109,8 @@ bitflags! {
        const ThreePcrs = 1 << 3;
        /// Can we pass a random seed to the kernel?
        const RandomSeed = 1 << 4;
+       /// Are configuration extensions picked up from the boot partition?
+       const PickUpConfExts = 1 << 8;
        /// Are `StubDevicePartUUID` and `StubImageIdentifier` loaded in UEFI variables?
        const ReportStubPartition = 1 << 10;
     }
@@ -173,6 +175,7 @@ pub fn export_efi_variables(stub_info_name: &str) -> Result<()> {
         | EfiStubFeatures::PickUpCredentials
         | EfiStubFeatures::PickUpSysExts
         | EfiStubFeatures::ThreePcrs
+        | EfiStubFeatures::PickUpConfExts
         | EfiStubFeatures::ReportStubPartition;
 
     let loaded_image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())?;

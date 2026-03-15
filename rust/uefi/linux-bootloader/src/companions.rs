@@ -1,7 +1,7 @@
 use crate::cpio::{Cpio, pack_cpio};
 use alloc::{format, string::String, string::ToString, vec::Vec};
 use uefi::{
-    CString16, cstr16,
+    CStr16, CString16, cstr16,
     fs::{Path, PathBuf},
     proto::device_path::{
         DevicePath,
@@ -9,8 +9,8 @@ use uefi::{
     },
 };
 
-const GLOBAL_CREDENTIALS_DIR: &uefi::CStr16 = cstr16!("\\loader\\credentials");
-const GLOBAL_SYSEXTS_DIR: &uefi::CStr16 = cstr16!("\\loader\\extensions");
+const GLOBAL_CREDENTIALS_DIR: &CStr16 = cstr16!("\\loader\\credentials");
+const GLOBAL_EXTENSIONS_DIR: &CStr16 = cstr16!("\\loader\\extensions");
 
 /// Locate files with ASCII filenames and matching the suffix passed as a parameter.
 /// Returns a list of their paths.
@@ -110,8 +110,6 @@ pub fn get_default_dropin_directory(
     loaded_image_file_path: &DevicePath,
     fs: &mut uefi::fs::FileSystem,
 ) -> uefi::Result<Option<PathBuf>> {
-    // We could use LoadedImageDevicePath to get the full device path and patch the file node in place.
-    // Converting to a path string keeps the compatibility logic for Automatic Boot Assessment suffixes simple.
     let image_path = loaded_image_file_path
         .to_string16(DisplayOnly(false), AllowShortcuts(false))
         .map_err(|_dpp_error| {
@@ -146,6 +144,8 @@ pub enum CompanionInitrdType {
     GlobalCredentials,
     SystemExtension,
     GlobalSystemExtension,
+    ConfigurationExtension,
+    GlobalConfigurationExtension,
     PcrSignature,
     PcrPublicKey,
 }
@@ -169,14 +169,13 @@ pub fn discover_credentials(
 ) -> uefi::Result<Vec<CompanionInitrd>> {
     let mut companions = Vec::new();
 
-    if fs.try_exists(GLOBAL_CREDENTIALS_DIR).unwrap() {
+    if fs.try_exists(GLOBAL_CREDENTIALS_DIR).unwrap_or(false) {
         let metadata = fs.metadata(GLOBAL_CREDENTIALS_DIR).map_err(|_err| {
             log::warn!("Failed to obtain metadata on `\\loader\\credentials` path (which is supposed to exist)");
             uefi::Error::new(uefi::Status::VOLUME_CORRUPTED, ())
         })?;
         if metadata.is_directory() {
-            let global_credentials: Vec<PathBuf> =
-                find_files(fs, GLOBAL_CREDENTIALS_DIR.as_ref(), ".cred")?;
+            let global_credentials = find_files(fs, GLOBAL_CREDENTIALS_DIR.as_ref(), ".cred")?;
 
             if !global_credentials.is_empty() {
                 companions.push(CompanionInitrd {
@@ -195,7 +194,7 @@ pub fn discover_credentials(
     }
 
     if let Some(default_dropin_dir) = default_dropin_dir {
-        let local_credentials: Vec<PathBuf> = find_files(fs, default_dropin_dir, ".cred")?;
+        let local_credentials = find_files(fs, default_dropin_dir, ".cred")?;
 
         if !local_credentials.is_empty() {
             companions.push(CompanionInitrd {
@@ -208,49 +207,89 @@ pub fn discover_credentials(
 
     Ok(companions)
 }
-/// Discover system extension images from the local drop-in directory next to the image and from the
-/// global `/loader/extensions` directory.
+
+/// Discover extension images (sysexts or confexts) from the image-specific drop-in directory
+/// and the global extensions directory.
 ///
-/// Those will be unmeasured, you are responsible for measuring them or not.
-/// But CPIOs are guaranteed to be stable and independent of file discovery order.
-pub fn discover_system_extensions(
+/// CPIOs are guaranteed to be stable and independent of file discovery order.
+fn discover_extensions(
     fs: &mut uefi::fs::FileSystem,
     default_dropin_dir: Option<&Path>,
+    suffix: &str,
+    excluded_suffix: Option<&str>,
+    local_cpio_target: &str,
+    global_cpio_target: &str,
+    local_type: CompanionInitrdType,
+    global_type: CompanionInitrdType,
 ) -> uefi::Result<Vec<CompanionInitrd>> {
     let mut companions = Vec::new();
 
-    if let Some(default_dropin_dir) = default_dropin_dir {
-        let sysexts = find_files_filtered(fs, default_dropin_dir, ".raw", Some(".confext.raw"))?;
-
-        if !sysexts.is_empty() {
-            companions.push(CompanionInitrd {
-                r#type: CompanionInitrdType::SystemExtension,
-                cpio: pack_cpio(fs, sysexts, ".extra/sysext", 0o555, 0o444)
-                    .map_err(|_err| uefi::Status::LOAD_ERROR)?,
-            });
-        }
-    }
-
-    if fs.try_exists(GLOBAL_SYSEXTS_DIR).unwrap() {
-        let metadata = fs.metadata(GLOBAL_SYSEXTS_DIR).map_err(|_err| {
+    if fs.try_exists(GLOBAL_EXTENSIONS_DIR).unwrap_or(false) {
+        let metadata = fs.metadata(GLOBAL_EXTENSIONS_DIR).map_err(|_err| {
             log::warn!("Failed to obtain metadata on `\\loader\\extensions` path (which is supposed to exist)");
             uefi::Error::new(uefi::Status::VOLUME_CORRUPTED, ())
         })?;
         if metadata.is_directory() {
-            let global_sysexts =
-                find_files_filtered(fs, GLOBAL_SYSEXTS_DIR.as_ref(), ".raw", Some(".confext.raw"))?;
-
-            if !global_sysexts.is_empty() {
+            let global_files =
+                find_files_filtered(fs, GLOBAL_EXTENSIONS_DIR.as_ref(), suffix, excluded_suffix)?;
+            if !global_files.is_empty() {
                 companions.push(CompanionInitrd {
-                    r#type: CompanionInitrdType::GlobalSystemExtension,
-                    cpio: pack_cpio(fs, global_sysexts, ".extra/global_sysext", 0o555, 0o444)
+                    r#type: global_type,
+                    cpio: pack_cpio(fs, global_files, global_cpio_target, 0o555, 0o444)
                         .map_err(|_err| uefi::Status::LOAD_ERROR)?,
                 });
             }
         }
     }
 
+    if let Some(dropin_dir) = default_dropin_dir {
+        let local_files = find_files_filtered(fs, dropin_dir, suffix, excluded_suffix)?;
+        if !local_files.is_empty() {
+            companions.push(CompanionInitrd {
+                r#type: local_type,
+                cpio: pack_cpio(fs, local_files, local_cpio_target, 0o555, 0o444)
+                    .map_err(|_err| uefi::Status::LOAD_ERROR)?,
+            });
+        }
+    }
+
     Ok(companions)
+}
+
+/// Discover system extension images (*.raw, excluding *.confext.raw) from the local drop-in
+/// directory next to the image and from the global `\loader\extensions\` directory.
+pub fn discover_system_extensions(
+    fs: &mut uefi::fs::FileSystem,
+    default_dropin_dir: Option<&Path>,
+) -> uefi::Result<Vec<CompanionInitrd>> {
+    discover_extensions(
+        fs,
+        default_dropin_dir,
+        ".raw",
+        Some(".confext.raw"),
+        ".extra/sysext",
+        ".extra/global_sysext",
+        CompanionInitrdType::SystemExtension,
+        CompanionInitrdType::GlobalSystemExtension,
+    )
+}
+
+/// Discover configuration extension images (*.confext.raw) from the local drop-in directory
+/// next to the image and from the global `\loader\extensions\` directory.
+pub fn discover_configuration_extensions(
+    fs: &mut uefi::fs::FileSystem,
+    default_dropin_dir: Option<&Path>,
+) -> uefi::Result<Vec<CompanionInitrd>> {
+    discover_extensions(
+        fs,
+        default_dropin_dir,
+        ".confext.raw",
+        None,
+        ".extra/confext",
+        ".extra/global_confext",
+        CompanionInitrdType::ConfigurationExtension,
+        CompanionInitrdType::GlobalConfigurationExtension,
+    )
 }
 
 #[cfg(test)]

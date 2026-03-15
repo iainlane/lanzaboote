@@ -10,7 +10,8 @@ mod thin;
 use crate::thin::UkiComponents;
 use alloc::vec::Vec;
 use linux_bootloader::companions::{
-    discover_credentials, discover_system_extensions, get_default_dropin_directory,
+    discover_configuration_extensions, discover_credentials, discover_system_extensions,
+    get_default_dropin_directory,
 };
 use linux_bootloader::cpio::pack_cpio_literal;
 use linux_bootloader::efivars::{EfiLoaderFeatures, export_efi_variables, get_loader_features};
@@ -149,23 +150,26 @@ fn main() -> Status {
                 default_dropin_directory = None;
             }
 
-            // TODO: how to do the proper .as_ref()? Should I take AsRef in the call definition… ?
-            if let Ok(mut system_credentials) = discover_credentials(
-                &mut filesystem,
-                default_dropin_directory.as_ref().map(|x| x.as_ref()),
-            ) {
-                companions.append(&mut system_credentials);
+            let dropin_ref = default_dropin_directory.as_ref().map(|x| x.as_ref());
+
+            if let Ok(mut creds) = discover_credentials(&mut filesystem, dropin_ref) {
+                companions.append(&mut creds);
             } else {
                 warn!("Failed to discover any system credential");
             }
 
-            if let Ok(mut system_extensions) = discover_system_extensions(
-                &mut filesystem,
-                default_dropin_directory.as_ref().map(|x| x.as_ref()),
-            ) {
-                companions.append(&mut system_extensions);
+            if let Ok(mut sysexts) = discover_system_extensions(&mut filesystem, dropin_ref) {
+                companions.append(&mut sysexts);
             } else {
                 warn!("Failed to discover any system extension");
+            }
+
+            if let Ok(mut confexts) =
+                discover_configuration_extensions(&mut filesystem, dropin_ref)
+            {
+                companions.append(&mut confexts);
+            } else {
+                warn!("Failed to discover any configuration extension");
             }
 
             if is_tpm_available {
