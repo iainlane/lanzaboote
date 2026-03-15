@@ -45,7 +45,14 @@ pub fn tpm_log_event_utf16(
     let Ok(mut tpm2) = open_capable_tpm2() else {
         return Ok(false);
     };
-    let event = v2::PcrEventInputs::new_in_box(pcr_index, EventType::IPL, description_utf16)
+    let description = if description_utf16.ends_with(&[0, 0]) {
+        description_utf16.to_vec()
+    } else {
+        let mut description = description_utf16.to_vec();
+        description.extend_from_slice(&[0, 0]);
+        description
+    };
+    let event = v2::PcrEventInputs::new_in_box(pcr_index, EventType::IPL, &description)
         .discard_errdata()?;
     // FIXME: what do we want as flags here?
     tpm2.hash_log_extend_event(Default::default(), buffer, &event)?;
@@ -58,9 +65,10 @@ pub fn tpm_log_event_ascii(
     buffer: &[u8],
     description: &str,
 ) -> uefi::Result<bool> {
-    let description_encoded = description
+    let mut description_encoded = description
         .encode_utf16()
         .flat_map(|c| c.to_le_bytes())
         .collect::<Vec<_>>();
+    description_encoded.extend_from_slice(&[0, 0]);
     tpm_log_event_utf16(pcr_index, buffer, &description_encoded)
 }

@@ -163,7 +163,8 @@ where
 pub fn export_efi_variables(stub_info_name: &str) -> Result<()> {
     let stub_features: EfiStubFeatures = EfiStubFeatures::ReportBootPartition
         | EfiStubFeatures::PickUpCredentials
-        | EfiStubFeatures::PickUpSysExts;
+        | EfiStubFeatures::PickUpSysExts
+        | EfiStubFeatures::ThreePcrs;
 
     let loaded_image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())?;
 

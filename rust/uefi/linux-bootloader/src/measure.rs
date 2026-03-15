@@ -5,7 +5,7 @@ use crate::{
     uefi_helpers::{ParsedPe, PeInMemory},
     unified_sections::UnifiedSection,
 };
-use alloc::{string::ToString, vec::Vec};
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use log::info;
 use uefi::{
     cstr16,
@@ -54,6 +54,16 @@ fn set_stub_pcr_variable(name: &uefi::CStr16, pcr_index: PcrIndex) -> uefi::Resu
         &encode_pcr_index(pcr_index),
     )?;
     Ok(())
+}
+
+fn ensure_utf16_bytes_with_nul(bytes: &[u8]) -> Cow<'_, [u8]> {
+    if bytes.ends_with(&[0, 0]) {
+        Cow::Borrowed(bytes)
+    } else {
+        let mut owned = bytes.to_vec();
+        owned.extend_from_slice(&[0, 0]);
+        Cow::Owned(owned)
+    }
 }
 
 pub fn measure_image(
@@ -126,8 +136,17 @@ pub fn measure_load_options(load_options: &[u8]) -> uefi::Result<bool> {
         return Ok(false);
     }
 
-    if tpm_log_event_utf16(TPM_PCR_INDEX_KERNEL_CONFIG, load_options, load_options)? {
-        set_stub_pcr_variable(cstr16!("StubPcrKernelParameters"), TPM_PCR_INDEX_KERNEL_CONFIG)?;
+    let load_options = ensure_utf16_bytes_with_nul(load_options);
+
+    if tpm_log_event_utf16(
+        TPM_PCR_INDEX_KERNEL_CONFIG,
+        load_options.as_ref(),
+        load_options.as_ref(),
+    )? {
+        set_stub_pcr_variable(
+            cstr16!("StubPcrKernelParameters"),
+            TPM_PCR_INDEX_KERNEL_CONFIG,
+        )?;
         return Ok(true);
     }
 
