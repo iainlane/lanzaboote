@@ -34,25 +34,33 @@ pub fn tpm_available() -> bool {
 
 /// Log an event in the TPM with `buffer` as data.
 /// Returns a boolean whether the measurement has been done or not in case of success.
+pub fn tpm_log_event_utf16(
+    pcr_index: PcrIndex,
+    buffer: &[u8],
+    description_utf16: &[u8],
+) -> uefi::Result<bool> {
+    if pcr_index.0 == u32::MAX {
+        return Ok(false);
+    }
+    let Ok(mut tpm2) = open_capable_tpm2() else {
+        return Ok(false);
+    };
+    let event = v2::PcrEventInputs::new_in_box(pcr_index, EventType::IPL, description_utf16)
+        .discard_errdata()?;
+    // FIXME: what do we want as flags here?
+    tpm2.hash_log_extend_event(Default::default(), buffer, &event)?;
+
+    Ok(true)
+}
+
 pub fn tpm_log_event_ascii(
     pcr_index: PcrIndex,
     buffer: &[u8],
     description: &str,
-) -> uefi::Result<()> {
-    if pcr_index.0 == u32::MAX {
-        return Err(uefi::Status::UNSUPPORTED.into());
-    }
-    if let Ok(mut tpm2) = open_capable_tpm2() {
-        let description_encoded = description
-            .encode_utf16()
-            .flat_map(|c| c.to_le_bytes())
-            .collect::<Vec<_>>();
-
-        let event = v2::PcrEventInputs::new_in_box(pcr_index, EventType::IPL, &description_encoded)
-            .discard_errdata()?;
-        // FIXME: what do we want as flags here?
-        tpm2.hash_log_extend_event(Default::default(), buffer, &event)?;
-    }
-
-    Ok(())
+) -> uefi::Result<bool> {
+    let description_encoded = description
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect::<Vec<_>>();
+    tpm_log_event_utf16(pcr_index, buffer, &description_encoded)
 }

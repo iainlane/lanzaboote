@@ -1,7 +1,7 @@
 use crate::{
     companions::{CompanionInitrd, CompanionInitrdType},
     efivars::BOOT_LOADER_VENDOR_UUID,
-    tpm::tpm_log_event_ascii,
+    tpm::{tpm_log_event_ascii, tpm_log_event_utf16},
     uefi_helpers::{ParsedPe, PeInMemory},
     unified_sections::UnifiedSection,
 };
@@ -33,7 +33,27 @@ const TPM_PCR_INDEX_SYSEXTS: PcrIndex = PcrIndex(13);
 
 /// Measure arbitrary data into PCR 4 via an IPL event.
 pub fn measure_boot_loader(buffer: &[u8], description: &str) -> uefi::Result<()> {
-    tpm_log_event_ascii(TPM_PCR_INDEX_BOOT_LOADER, buffer, description)
+    tpm_log_event_ascii(TPM_PCR_INDEX_BOOT_LOADER, buffer, description)?;
+    Ok(())
+}
+
+fn encode_pcr_index(pcr_index: PcrIndex) -> Vec<u8> {
+    pcr_index
+        .0
+        .to_string()
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect::<Vec<u8>>()
+}
+
+fn set_stub_pcr_variable(name: &uefi::CStr16, pcr_index: PcrIndex) -> uefi::Result<()> {
+    runtime::set_variable(
+        name,
+        &BOOT_LOADER_VENDOR_UUID,
+        VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS,
+        &encode_pcr_index(pcr_index),
+    )?;
+    Ok(())
 }
 
 pub fn measure_image(
@@ -91,24 +111,27 @@ pub fn measure_image(
     }
 
     if measurements > 0 {
-        let pcr_index_encoded = TPM_PCR_INDEX_KERNEL_IMAGE
-            .0
-            .to_string()
-            .encode_utf16()
-            .flat_map(|c| c.to_le_bytes())
-            .collect::<Vec<u8>>();
-
         // If we did some measurements, expose a variable encoding the PCR where
         // we have done the measurements.
-        runtime::set_variable(
-            cstr16!("StubPcrKernelImage"),
-            &BOOT_LOADER_VENDOR_UUID,
-            VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS,
-            &pcr_index_encoded,
-        )?;
+        set_stub_pcr_variable(cstr16!("StubPcrKernelImage"), TPM_PCR_INDEX_KERNEL_IMAGE)?;
     }
 
     Ok(measurements)
+}
+
+/// Measure a custom load-options string into PCR 12 using systemd-stub's event encoding.
+/// The buffer is expected to contain UTF-16LE data suitable for Linux EFI handoff.
+pub fn measure_load_options(load_options: &[u8]) -> uefi::Result<bool> {
+    if load_options.is_empty() {
+        return Ok(false);
+    }
+
+    if tpm_log_event_utf16(TPM_PCR_INDEX_KERNEL_CONFIG, load_options, load_options)? {
+        set_stub_pcr_variable(cstr16!("StubPcrKernelParameters"), TPM_PCR_INDEX_KERNEL_CONFIG)?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 /// Performs all the expected measurements for any list of
@@ -162,25 +185,25 @@ pub fn measure_companion_initrds(companions: &[CompanionInitrd]) -> uefi::Result
                     sysext_measured = true;
                 }
             }
+            CompanionInitrdType::GlobalSystemExtension => {
+                if tpm_log_event_ascii(
+                    TPM_PCR_INDEX_SYSEXTS,
+                    initrd.cpio.as_ref(),
+                    "Global system extension initrd",
+                )? {
+                    measurements += 1;
+                    sysext_measured = true;
+                }
+            }
         }
     }
 
     if credentials_measured > 0 {
-        runtime::set_variable(
-            cstr16!("StubPcrKernelParameters"),
-            &BOOT_LOADER_VENDOR_UUID,
-            VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS,
-            &TPM_PCR_INDEX_KERNEL_CONFIG.0.to_le_bytes(),
-        )?;
+        set_stub_pcr_variable(cstr16!("StubPcrKernelParameters"), TPM_PCR_INDEX_KERNEL_CONFIG)?;
     }
 
     if sysext_measured {
-        runtime::set_variable(
-            cstr16!("StubPcrInitRDSysExts"),
-            &BOOT_LOADER_VENDOR_UUID,
-            VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS,
-            &TPM_PCR_INDEX_SYSEXTS.0.to_le_bytes(),
-        )?;
+        set_stub_pcr_variable(cstr16!("StubPcrInitRDSysExts"), TPM_PCR_INDEX_SYSEXTS)?;
     }
 
     Ok(measurements)

@@ -1,5 +1,5 @@
 use crate::cpio::{Cpio, pack_cpio};
-use alloc::{string::ToString, vec::Vec};
+use alloc::{format, string::String, string::ToString, vec::Vec};
 use uefi::{
     CString16, cstr16,
     fs::{Path, PathBuf},
@@ -9,6 +9,9 @@ use uefi::{
     },
 };
 
+const GLOBAL_CREDENTIALS_DIR: &uefi::CStr16 = cstr16!("\\loader\\credentials");
+const GLOBAL_SYSEXTS_DIR: &uefi::CStr16 = cstr16!("\\loader\\extensions");
+
 /// Locate files with ASCII filenames and matching the suffix passed as a parameter.
 /// Returns a list of their paths.
 pub fn find_files(
@@ -16,17 +19,31 @@ pub fn find_files(
     search_path: &Path,
     suffix: &str,
 ) -> uefi::Result<Vec<PathBuf>> {
+    find_files_filtered(fs, search_path, suffix, None)
+}
+
+/// Locate files with ASCII filenames and matching the suffix passed as a parameter, while
+/// excluding a more specific suffix if requested.
+pub fn find_files_filtered(
+    fs: &mut uefi::fs::FileSystem,
+    search_path: &Path,
+    suffix: &str,
+    excluded_suffix: Option<&str>,
+) -> uefi::Result<Vec<PathBuf>> {
     let mut results = Vec::new();
 
     for maybe_entry in fs.read_dir(search_path).unwrap() {
         let entry = maybe_entry?;
         if entry.is_regular_file() {
             let fname = entry.file_name();
-            if fname.is_ascii() && fname.to_string().ends_with(suffix) {
-                let mut full_path = CString16::from(search_path.to_cstr16());
-                full_path.push_str(cstr16!("\\"));
-                full_path.push_str(fname);
-                results.push(full_path.into());
+            if fname.is_ascii() {
+                let filename = fname.to_string();
+                if filename_matches_suffix(&filename, suffix, excluded_suffix) {
+                    let mut full_path = CString16::from(search_path.to_cstr16());
+                    full_path.push_str(cstr16!("\\"));
+                    full_path.push_str(fname);
+                    results.push(full_path.into());
+                }
             }
         }
     }
@@ -34,39 +51,101 @@ pub fn find_files(
     Ok(results)
 }
 
-/// Returns the "default" drop-in directory if it exists.
-/// This will be in general $loaded_image_path.extra/
+fn filename_matches_suffix(filename: &str, suffix: &str, excluded_suffix: Option<&str>) -> bool {
+    filename
+        .get(filename.len().saturating_sub(suffix.len())..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+        && excluded_suffix.is_none_or(|excluded| {
+            filename
+                .get(filename.len().saturating_sub(excluded.len())..)
+                .is_none_or(|tail| !tail.eq_ignore_ascii_case(excluded))
+        })
+}
+
+fn strip_automatic_boot_assessment_counter(stem: &str) -> &str {
+    let Some((prefix, tail)) = stem.rsplit_once('+') else {
+        return stem;
+    };
+    let Some((tries_left, tries_done)) = tail.split_once('-') else {
+        return stem;
+    };
+
+    if !tries_left.is_empty()
+        && !tries_done.is_empty()
+        && tries_left.chars().all(|c| c.is_ascii_digit())
+        && tries_done.chars().all(|c| c.is_ascii_digit())
+    {
+        prefix
+    } else {
+        stem
+    }
+}
+
+fn image_dropin_directory_path(image_path: &str) -> String {
+    let Some((directory, filename)) = image_path.rsplit_once('\\') else {
+        return format!(
+            "{}.extra.d",
+            strip_automatic_boot_assessment_counter(image_path)
+        );
+    };
+    let Some(stem) = filename.strip_suffix(".efi") else {
+        return format!("{image_path}.extra.d");
+    };
+
+    format!(
+        "{}\\{}.efi.extra.d",
+        directory,
+        strip_automatic_boot_assessment_counter(stem)
+    )
+}
+
+fn legacy_image_dropin_directory_path(image_path: &str) -> String {
+    format!("{image_path}.extra")
+}
+
+/// Returns the preferred image-specific companion drop-in directory if it exists.
+/// The systemd-stub-compatible `<image>.efi.extra.d/` directory is preferred, while the
+/// historical lanzaboote `<image>.extra/` directory is retained as a compatibility fallback.
 pub fn get_default_dropin_directory(
     loaded_image_file_path: &DevicePath,
     fs: &mut uefi::fs::FileSystem,
 ) -> uefi::Result<Option<PathBuf>> {
-    // We could use LoadedImageDevicePath to get the full device path
-    // and perform replacement of the last node before END_ENTIRE
-    // by another node containing the filename + .extra
-    // But this is as much tedious as performing a conversion to string
-    // then opening the root directory and finding the new directory.
-    let mut target_directory = loaded_image_file_path
+    // We could use LoadedImageDevicePath to get the full device path and patch the file node in place.
+    // Converting to a path string keeps the compatibility logic for Automatic Boot Assessment suffixes simple.
+    let image_path = loaded_image_file_path
         .to_string16(DisplayOnly(false), AllowShortcuts(false))
         .map_err(|_dpp_error| {
             log::warn!("Failed to obtain string representation of the loaded image file path");
             uefi::Error::new(uefi::Status::NOT_FOUND, ())
-        })?;
-    target_directory.push_str(cstr16!(".extra"));
+        })?
+        .to_string();
 
-    Ok(fs
-        .metadata(target_directory.as_ref())
-        .ok()
-        .and_then(|metadata| {
-            metadata
-                .is_directory()
-                .then(|| PathBuf::from(target_directory))
-        }))
+    for candidate in [
+        image_dropin_directory_path(&image_path),
+        legacy_image_dropin_directory_path(&image_path),
+    ] {
+        let target_directory = CString16::try_from(candidate.as_str()).map_err(|_| {
+            log::warn!("Failed to encode image-specific companion directory");
+            uefi::Error::new(uefi::Status::NOT_FOUND, ())
+        })?;
+
+        if fs
+            .metadata(target_directory.as_ref())
+            .ok()
+            .is_some_and(|metadata| metadata.is_directory())
+        {
+            return Ok(Some(PathBuf::from(target_directory)));
+        }
+    }
+
+    Ok(None)
 }
 
 pub enum CompanionInitrdType {
     Credentials,
     GlobalCredentials,
     SystemExtension,
+    GlobalSystemExtension,
     PcrSignature,
     PcrPublicKey,
 }
@@ -81,25 +160,23 @@ pub struct CompanionInitrd {
 /// Collect all credentials and return them as CPIO archive.
 ///
 /// There are two variants of credentials:
-///   - global: `$ESP/loader.credentials/*.cred`
-///   - image-specific: `$path_to_image.extra/*.cred`
-///
-/// The credentials are not measured.
+///   - global: `$ESP/loader/credentials/*.cred`
+///   - image-specific: `<image>.efi.extra.d/*.cred`
+/// These are later measured into PCR 12 when TPM support is available.
 pub fn discover_credentials(
     fs: &mut uefi::fs::FileSystem,
     default_dropin_dir: Option<&Path>,
 ) -> uefi::Result<Vec<CompanionInitrd>> {
     let mut companions = Vec::new();
 
-    let default_global_dropin_dir = cstr16!("\\loader\\credentials");
-    if fs.try_exists(default_global_dropin_dir).unwrap() {
-        let metadata = fs.metadata(default_global_dropin_dir).map_err(|_err| {
+    if fs.try_exists(GLOBAL_CREDENTIALS_DIR).unwrap() {
+        let metadata = fs.metadata(GLOBAL_CREDENTIALS_DIR).map_err(|_err| {
             log::warn!("Failed to obtain metadata on `\\loader\\credentials` path (which is supposed to exist)");
             uefi::Error::new(uefi::Status::VOLUME_CORRUPTED, ())
         })?;
         if metadata.is_directory() {
             let global_credentials: Vec<PathBuf> =
-                find_files(fs, default_global_dropin_dir.as_ref(), ".cred")?;
+                find_files(fs, GLOBAL_CREDENTIALS_DIR.as_ref(), ".cred")?;
 
             if !global_credentials.is_empty() {
                 companions.push(CompanionInitrd {
@@ -131,25 +208,118 @@ pub fn discover_credentials(
 
     Ok(companions)
 }
-/// Discover any system image extension, i.e. files ending by .raw
-/// They must be present inside $path_to_image.extra/*.raw, specific to this image.
+/// Discover system extension images from the local drop-in directory next to the image and from the
+/// global `/loader/extensions` directory.
 ///
 /// Those will be unmeasured, you are responsible for measuring them or not.
 /// But CPIOs are guaranteed to be stable and independent of file discovery order.
 pub fn discover_system_extensions(
     fs: &mut uefi::fs::FileSystem,
-    default_dropin_dir: &Path,
+    default_dropin_dir: Option<&Path>,
 ) -> uefi::Result<Vec<CompanionInitrd>> {
     let mut companions = Vec::new();
-    let sysexts = find_files(fs, default_dropin_dir, ".raw")?;
 
-    if !sysexts.is_empty() {
-        companions.push(CompanionInitrd {
-            r#type: CompanionInitrdType::SystemExtension,
-            cpio: pack_cpio(fs, sysexts, ".extra/sysext", 0o555, 0o444)
-                .map_err(|_err| uefi::Status::LOAD_ERROR)?,
-        });
+    if let Some(default_dropin_dir) = default_dropin_dir {
+        let sysexts = find_files_filtered(fs, default_dropin_dir, ".raw", Some(".confext.raw"))?;
+
+        if !sysexts.is_empty() {
+            companions.push(CompanionInitrd {
+                r#type: CompanionInitrdType::SystemExtension,
+                cpio: pack_cpio(fs, sysexts, ".extra/sysext", 0o555, 0o444)
+                    .map_err(|_err| uefi::Status::LOAD_ERROR)?,
+            });
+        }
+    }
+
+    if fs.try_exists(GLOBAL_SYSEXTS_DIR).unwrap() {
+        let metadata = fs.metadata(GLOBAL_SYSEXTS_DIR).map_err(|_err| {
+            log::warn!("Failed to obtain metadata on `\\loader\\extensions` path (which is supposed to exist)");
+            uefi::Error::new(uefi::Status::VOLUME_CORRUPTED, ())
+        })?;
+        if metadata.is_directory() {
+            let global_sysexts =
+                find_files_filtered(fs, GLOBAL_SYSEXTS_DIR.as_ref(), ".raw", Some(".confext.raw"))?;
+
+            if !global_sysexts.is_empty() {
+                companions.push(CompanionInitrd {
+                    r#type: CompanionInitrdType::GlobalSystemExtension,
+                    cpio: pack_cpio(fs, global_sysexts, ".extra/global_sysext", 0o555, 0o444)
+                        .map_err(|_err| uefi::Status::LOAD_ERROR)?,
+                });
+            }
+        }
     }
 
     Ok(companions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        filename_matches_suffix, image_dropin_directory_path, legacy_image_dropin_directory_path,
+        strip_automatic_boot_assessment_counter,
+    };
+
+    #[test]
+    fn strips_boot_assessment_counter_from_image_name() {
+        assert_eq!(
+            image_dropin_directory_path("\\EFI\\Linux\\nixos-generation-1+3-1.efi"),
+            "\\EFI\\Linux\\nixos-generation-1.efi.extra.d"
+        );
+    }
+
+    #[test]
+    fn keeps_plain_image_name_for_dropin_directory() {
+        assert_eq!(
+            image_dropin_directory_path("\\EFI\\Linux\\nixos-generation-1.efi"),
+            "\\EFI\\Linux\\nixos-generation-1.efi.extra.d"
+        );
+    }
+
+    #[test]
+    fn keeps_legacy_dropin_path_shape_for_compatibility() {
+        assert_eq!(
+            legacy_image_dropin_directory_path("\\EFI\\Linux\\nixos-generation-1.efi"),
+            "\\EFI\\Linux\\nixos-generation-1.efi.extra"
+        );
+    }
+
+    #[test]
+    fn only_strips_valid_automatic_boot_assessment_suffixes() {
+        assert_eq!(strip_automatic_boot_assessment_counter("foo+3-0"), "foo");
+        assert_eq!(
+            strip_automatic_boot_assessment_counter("foo+3-bar"),
+            "foo+3-bar"
+        );
+        assert_eq!(strip_automatic_boot_assessment_counter("foo"), "foo");
+    }
+
+    #[test]
+    fn excludes_confexts_from_sysext_scan() {
+        assert!(filename_matches_suffix(
+            "addon.sysext.raw",
+            ".raw",
+            Some(".confext.raw")
+        ));
+        assert!(!filename_matches_suffix(
+            "addon.confext.raw",
+            ".raw",
+            Some(".confext.raw")
+        ));
+    }
+
+    #[test]
+    fn suffix_matching_is_case_insensitive() {
+        assert!(filename_matches_suffix("KERNEL.CRED", ".cred", None));
+        assert!(filename_matches_suffix(
+            "addon.CONFEXT.RAW",
+            ".confext.raw",
+            None
+        ));
+        assert!(!filename_matches_suffix(
+            "addon.CONFEXT.RAW",
+            ".raw",
+            Some(".confext.raw")
+        ));
+    }
 }

@@ -8,6 +8,10 @@ use uefi::{
 use linux_bootloader::linux_loader::InitrdLoader;
 use linux_bootloader::measure::measure_boot_loader;
 use linux_bootloader::pe_loader::Image;
+pub struct ResolvedCmdline {
+    pub bytes: Vec<u8>,
+    pub should_measure_in_pcr12: bool,
+}
 
 /// Obtain the kernel command line that should be used for booting.
 ///
@@ -16,8 +20,9 @@ use linux_bootloader::pe_loader::Image;
 ///
 /// If we read a user provided cmdline, we measure it into PCR4 to invalidate the PCR. This way we
 /// can support Measured Boot without Secure Boot while still giving users the option to edit the
-/// kernel cmdline on the fly for debugging.
-pub fn get_cmdline(embedded: &CStr16) -> Vec<u8> {
+/// kernel cmdline on the fly for debugging. The caller additionally measures it into PCR12, like
+/// systemd-stub does for custom load options.
+pub fn get_cmdline(embedded: &CStr16) -> ResolvedCmdline {
     let secure_boot_enabled = get_secure_boot_status();
     if !secure_boot_enabled {
         let load_options = get_load_options();
@@ -25,15 +30,24 @@ pub fn get_cmdline(embedded: &CStr16) -> Vec<u8> {
             // The passed cmdline is allowed to be the same as the embedded one without needing to
             // be measured.
             if passed == embedded.as_bytes() {
-                return passed;
+                return ResolvedCmdline {
+                    bytes: passed,
+                    should_measure_in_pcr12: false,
+                };
             }
             // Measuring is mandatory here. If the measurement fails, return the embedded cmdline.
             if measure_boot_loader(&passed, "Custom user provided kernel cmdline").is_ok() {
-                return passed;
+                return ResolvedCmdline {
+                    bytes: passed,
+                    should_measure_in_pcr12: true,
+                };
             }
         }
     }
-    embedded.as_bytes().to_vec()
+    ResolvedCmdline {
+        bytes: embedded.as_bytes().to_vec(),
+        should_measure_in_pcr12: false,
+    }
 }
 
 /// Obtain the load options of the currently loaded image.

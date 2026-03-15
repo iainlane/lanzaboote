@@ -159,14 +159,13 @@ fn main() -> Status {
                 warn!("Failed to discover any system credential");
             }
 
-            if let Some(default_dropin_dir) = default_dropin_directory {
-                if let Ok(mut system_extensions) =
-                    discover_system_extensions(&mut filesystem, &default_dropin_dir)
-                {
-                    companions.append(&mut system_extensions);
-                } else {
-                    warn!("Failed to discover any system extension");
-                }
+            if let Ok(mut system_extensions) = discover_system_extensions(
+                &mut filesystem,
+                default_dropin_directory.as_ref().map(|x| x.as_ref()),
+            ) {
+                companions.append(&mut system_extensions);
+            } else {
+                warn!("Failed to discover any system extension");
             }
 
             if is_tpm_available {

@@ -161,8 +161,9 @@ where
 
 /// Exports systemd-stub style EFI variables
 pub fn export_efi_variables(stub_info_name: &str) -> Result<()> {
-    let stub_features: EfiStubFeatures =
-        EfiStubFeatures::ReportBootPartition | EfiStubFeatures::PickUpCredentials;
+    let stub_features: EfiStubFeatures = EfiStubFeatures::ReportBootPartition
+        | EfiStubFeatures::PickUpCredentials
+        | EfiStubFeatures::PickUpSysExts;
 
     let loaded_image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())?;
 

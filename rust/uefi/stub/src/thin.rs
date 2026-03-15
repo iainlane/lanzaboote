@@ -1,5 +1,6 @@
 use crate::common::{boot_linux_unchecked, get_cmdline, get_secure_boot_status};
 use alloc::{string::String, vec::Vec};
+use linux_bootloader::measure::measure_load_options;
 use linux_bootloader::uefi_helpers::{ParsedPe, PeInMemory};
 use log::{error, warn};
 use sha2::{Digest, Sha256};
@@ -119,5 +120,9 @@ pub fn boot_linux(
         initrd_data.resize(initrd_data.len().next_multiple_of(4), 0);
     }
 
-    boot_linux_unchecked(handle, components.kernel_data, &cmdline, initrd_data)
+    if cmdline.should_measure_in_pcr12 {
+        let _ = measure_load_options(&cmdline.bytes);
+    }
+
+    boot_linux_unchecked(handle, components.kernel_data, &cmdline.bytes, initrd_data)
 }

@@ -13,6 +13,7 @@
     + (import ./common/efivariables-helper.nix)
     + ''
       machine.start()
+      machine.wait_for_unit("default.target")
 
       # TODO: the other variables are not yet supported.
       expected_variables = [
@@ -27,5 +28,11 @@
 
       # "Static" parts of the UKI is measured in PCR11
       assert_variable_string("StubPcrKernelImage", "11")
+
+      with subtest("bootctl reports measured-boot capabilities"):
+          bootctl_status = machine.succeed("bootctl status")
+          print(bootctl_status)
+          assert "Measures kernel+command line+sysexts" in bootctl_status
+          assert "Picks up system extension images from boot partition" in bootctl_status
     '';
 }

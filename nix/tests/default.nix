@@ -24,6 +24,7 @@ in
   systemd-boot-loader-config = runTest ./lanzaboote/systemd-boot-loader-config.nix;
   export-efivars = runTest ./lanzaboote/export-efivars.nix;
   export-efivars-tpm = runTest ./lanzaboote/export-efivars-tpm.nix;
+  stub-sysext-compat = runTest ./lanzaboote/stub-sysext-compat.nix;
   extra-efi-partitions = runTest ./lanzaboote/extra-efi-partitions.nix;
   auto-generate-enroll = runTest ./lanzaboote/auto-generate-enroll.nix;
   boot-counting = runTest ./lanzaboote/boot-counting.nix;
