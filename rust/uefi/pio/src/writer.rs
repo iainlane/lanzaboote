@@ -316,28 +316,33 @@ impl<IOError: embedded_io::Error + core::fmt::Debug> Cpio<IOError> {
     }
 
     pub fn pack_prefix(&mut self, path: &str, dir_mode: u32) -> Result<(), IOError> {
-        // TODO: bring Unix paths inside this crate?
-        // and just reuse &Path there and iterate over ancestors().rev()?
-        let mut ancestor = String::new();
-
-        // This will serialize all directory inodes of all prefix paths
-        // until the final directory which will be serialized with the proper `dir_mode`
-        let components = path.split('/');
-        let parts = components.clone().count();
-        if parts == 0 {
-            // packing the prefix of an empty path is trivial.
+        // Serialize directory inodes for all prefix paths of the given path.
+        // Leading directories get mode 0o555; only the final directory uses `dir_mode`.
+        // Paths must be relative (no leading '/') to match the file entries created
+        // by pack_one, which also uses relative paths.
+        let components: Vec<&str> = path.split('/').collect();
+        if components.is_empty() {
             return Ok(());
         }
 
-        let last = components.clone().next_back().unwrap();
-        let prefixes = components.take(parts - 1);
-
-        for component in prefixes {
-            ancestor = ancestor + "/" + component;
-            self.pack_dir(&ancestor, 0o555)?;
+        // Create intermediate directory entries (all but the last component)
+        let mut built = String::new();
+        for component in &components[..components.len() - 1] {
+            if built.is_empty() {
+                built = component.to_string();
+            } else {
+                built = built + "/" + component;
+            }
+            self.pack_dir(&built, 0o555)?;
         }
 
-        self.pack_dir(&(ancestor + "/" + last), dir_mode)
+        // Create the final directory entry with the requested mode
+        if built.is_empty() {
+            built = components.last().unwrap().to_string();
+        } else {
+            built = built + "/" + components.last().unwrap();
+        }
+        self.pack_dir(&built, dir_mode)
     }
 
     pub fn pack_trailer(&mut self) -> Result<usize, IOError> {
