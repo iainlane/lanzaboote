@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod common;
+mod random_seed;
 mod thin;
 
 use crate::thin::UkiComponents;
@@ -74,10 +75,9 @@ fn main() -> Status {
     if let Ok(features) = get_loader_features()
         && !features.contains(EfiLoaderFeatures::RandomSeed)
     {
-        // FIXME: read the random seed from the ESP and pass it to the kernel.
-        info!(
-            "The boot loader does not handle the random seed, and lanzaboote does not support passing it yet."
-        );
+        // The boot loader has not refreshed the random seed itself, so do it
+        // here and hand a fresh seed to the kernel.
+        random_seed::refresh_random_seed(secure_boot_enabled);
     }
 
     if export_efi_variables(STUB_NAME).is_err() {

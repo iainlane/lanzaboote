@@ -177,6 +177,7 @@ pub fn export_efi_variables(stub_info_name: &str) -> Result<()> {
         | EfiStubFeatures::PickUpCredentials
         | EfiStubFeatures::PickUpSysExts
         | EfiStubFeatures::ThreePcrs
+        | EfiStubFeatures::RandomSeed
         | EfiStubFeatures::CmdlineAddons
         | EfiStubFeatures::PickUpConfExts
         | EfiStubFeatures::ReportStubPartition;
