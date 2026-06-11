@@ -66,8 +66,10 @@ fn strip_automatic_boot_assessment_counter(stem: &str) -> &str {
     let Some((prefix, tail)) = stem.rsplit_once('+') else {
         return stem;
     };
-    let Some((tries_left, tries_done)) = tail.split_once('-') else {
-        return stem;
+
+    let (tries_left, tries_done) = match tail.split_once('-') {
+        Some(parts) => parts,
+        None => (tail, "0"),
     };
 
     if !tries_left.is_empty()
@@ -162,12 +164,26 @@ pub struct CompanionInitrd {
 /// There are two variants of credentials:
 ///   - global: `$ESP/loader/credentials/*.cred`
 ///   - image-specific: `<image>.efi.extra.d/*.cred`
+///
 /// These are later measured into PCR 12 when TPM support is available.
 pub fn discover_credentials(
     fs: &mut uefi::fs::FileSystem,
     default_dropin_dir: Option<&Path>,
 ) -> uefi::Result<Vec<CompanionInitrd>> {
     let mut companions = Vec::new();
+
+    if let Some(default_dropin_dir) = default_dropin_dir {
+        let local_credentials = find_files(fs, default_dropin_dir, ".cred")?;
+
+        if !local_credentials.is_empty() {
+            companions.push(CompanionInitrd {
+                r#type: CompanionInitrdType::Credentials,
+                cpio: pack_cpio(fs, local_credentials, ".extra/credentials", 0o500, 0o400)
+                    .map_err(|_err| uefi::Status::LOAD_ERROR)?,
+            });
+        }
+    }
+
 
     if fs.try_exists(GLOBAL_CREDENTIALS_DIR).unwrap_or(false) {
         let metadata = fs.metadata(GLOBAL_CREDENTIALS_DIR).map_err(|_err| {
@@ -193,19 +209,17 @@ pub fn discover_credentials(
         }
     }
 
-    if let Some(default_dropin_dir) = default_dropin_dir {
-        let local_credentials = find_files(fs, default_dropin_dir, ".cred")?;
-
-        if !local_credentials.is_empty() {
-            companions.push(CompanionInitrd {
-                r#type: CompanionInitrdType::Credentials,
-                cpio: pack_cpio(fs, local_credentials, ".extra/credentials", 0o500, 0o400)
-                    .map_err(|_err| uefi::Status::LOAD_ERROR)?,
-            });
-        }
-    }
-
     Ok(companions)
+}
+
+/// Describes how to discover and classify a particular kind of extension image.
+struct ExtensionKind {
+    suffix: &'static str,
+    excluded_suffix: Option<&'static str>,
+    local_cpio_target: &'static str,
+    global_cpio_target: &'static str,
+    local_type: CompanionInitrdType,
+    global_type: CompanionInitrdType,
 }
 
 /// Discover extension images (sysexts or confexts) from the image-specific drop-in directory
@@ -215,14 +229,21 @@ pub fn discover_credentials(
 fn discover_extensions(
     fs: &mut uefi::fs::FileSystem,
     default_dropin_dir: Option<&Path>,
-    suffix: &str,
-    excluded_suffix: Option<&str>,
-    local_cpio_target: &str,
-    global_cpio_target: &str,
-    local_type: CompanionInitrdType,
-    global_type: CompanionInitrdType,
+    kind: ExtensionKind,
 ) -> uefi::Result<Vec<CompanionInitrd>> {
     let mut companions = Vec::new();
+
+    if let Some(dropin_dir) = default_dropin_dir {
+        let local_files = find_files_filtered(fs, dropin_dir, kind.suffix, kind.excluded_suffix)?;
+        if !local_files.is_empty() {
+            companions.push(CompanionInitrd {
+                r#type: kind.local_type,
+                cpio: pack_cpio(fs, local_files, kind.local_cpio_target, 0o555, 0o444)
+                    .map_err(|_err| uefi::Status::LOAD_ERROR)?,
+            });
+        }
+    }
+
 
     if fs.try_exists(GLOBAL_EXTENSIONS_DIR).unwrap_or(false) {
         let metadata = fs.metadata(GLOBAL_EXTENSIONS_DIR).map_err(|_err| {
@@ -230,26 +251,19 @@ fn discover_extensions(
             uefi::Error::new(uefi::Status::VOLUME_CORRUPTED, ())
         })?;
         if metadata.is_directory() {
-            let global_files =
-                find_files_filtered(fs, GLOBAL_EXTENSIONS_DIR.as_ref(), suffix, excluded_suffix)?;
+            let global_files = find_files_filtered(
+                fs,
+                GLOBAL_EXTENSIONS_DIR.as_ref(),
+                kind.suffix,
+                kind.excluded_suffix,
+            )?;
             if !global_files.is_empty() {
                 companions.push(CompanionInitrd {
-                    r#type: global_type,
-                    cpio: pack_cpio(fs, global_files, global_cpio_target, 0o555, 0o444)
+                    r#type: kind.global_type,
+                    cpio: pack_cpio(fs, global_files, kind.global_cpio_target, 0o555, 0o444)
                         .map_err(|_err| uefi::Status::LOAD_ERROR)?,
                 });
             }
-        }
-    }
-
-    if let Some(dropin_dir) = default_dropin_dir {
-        let local_files = find_files_filtered(fs, dropin_dir, suffix, excluded_suffix)?;
-        if !local_files.is_empty() {
-            companions.push(CompanionInitrd {
-                r#type: local_type,
-                cpio: pack_cpio(fs, local_files, local_cpio_target, 0o555, 0o444)
-                    .map_err(|_err| uefi::Status::LOAD_ERROR)?,
-            });
         }
     }
 
@@ -265,12 +279,14 @@ pub fn discover_system_extensions(
     discover_extensions(
         fs,
         default_dropin_dir,
-        ".raw",
-        Some(".confext.raw"),
-        ".extra/sysext",
-        ".extra/global_sysext",
-        CompanionInitrdType::SystemExtension,
-        CompanionInitrdType::GlobalSystemExtension,
+        ExtensionKind {
+            suffix: ".raw",
+            excluded_suffix: Some(".confext.raw"),
+            local_cpio_target: ".extra/sysext",
+            global_cpio_target: ".extra/global_sysext",
+            local_type: CompanionInitrdType::SystemExtension,
+            global_type: CompanionInitrdType::GlobalSystemExtension,
+        },
     )
 }
 
@@ -283,12 +299,14 @@ pub fn discover_configuration_extensions(
     discover_extensions(
         fs,
         default_dropin_dir,
-        ".confext.raw",
-        None,
-        ".extra/confext",
-        ".extra/global_confext",
-        CompanionInitrdType::ConfigurationExtension,
-        CompanionInitrdType::GlobalConfigurationExtension,
+        ExtensionKind {
+            suffix: ".confext.raw",
+            excluded_suffix: None,
+            local_cpio_target: ".extra/confext",
+            global_cpio_target: ".extra/global_confext",
+            local_type: CompanionInitrdType::ConfigurationExtension,
+            global_type: CompanionInitrdType::GlobalConfigurationExtension,
+        },
     )
 }
 
@@ -326,6 +344,7 @@ mod tests {
     #[test]
     fn only_strips_valid_automatic_boot_assessment_suffixes() {
         assert_eq!(strip_automatic_boot_assessment_counter("foo+3-0"), "foo");
+        assert_eq!(strip_automatic_boot_assessment_counter("foo+3"), "foo");
         assert_eq!(
             strip_automatic_boot_assessment_counter("foo+3-bar"),
             "foo+3-bar"
