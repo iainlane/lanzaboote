@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use lanzaboote_shared::dropin_paths::{
+    filename_matches_suffix, strip_automatic_boot_assessment_counter,
+};
 use lanzaboote_shared::unified_sections::{
     UNIFIED_SECTION_ORDER, UnifiedSection, UnifiedSectionDataSource,
 };
@@ -22,6 +25,12 @@ pub struct LockThinStubArgs {
 }
 
 pub struct LockBootLoaderArgs {
+    pub systemd: PathBuf,
+    pub esp: PathBuf,
+    pub pcrlock: PathBuf,
+}
+
+pub struct LockSysextsArgs {
     pub systemd: PathBuf,
     pub esp: PathBuf,
     pub pcrlock: PathBuf,
@@ -68,6 +77,101 @@ pub fn lock_thin_stub(args: LockThinStubArgs) -> Result<LockResult> {
 
 fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Predict the PCR 13 measurement for the system extensions in a directory.
+///
+/// The stub packs the extension images into a CPIO archive and measures the
+/// archive bytes, so the prediction builds the same archive with the same
+/// writer and the same layout rules: images sorted, basenames only, fixed
+/// directory and file modes.
+fn sysext_cpio(dir: &Path, target_dir_prefix: &str) -> Result<Option<Vec<u8>>> {
+    let mut names = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", dir.display()));
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if filename_matches_suffix(&name, ".raw", Some(".confext.raw")) {
+            names.push(name);
+        }
+    }
+
+    if names.is_empty() {
+        return Ok(None);
+    }
+    names.sort();
+
+    // In-memory archive construction cannot perform IO, so it cannot fail.
+    let mut cpio = pio::writer::Cpio::<core::convert::Infallible>::new();
+    cpio.pack_prefix(target_dir_prefix, 0o555)
+        .map_err(|error| anyhow!("Failed to pack CPIO prefix: {error:?}"))?;
+    for name in names {
+        let contents = fs::read(dir.join(&name))
+            .with_context(|| format!("Failed to read {}", dir.join(&name).display()))?;
+        cpio.pack_one(&name, &contents, target_dir_prefix, 0o444)
+            .map_err(|error| anyhow!("Failed to pack {name} into CPIO: {error:?}"))?;
+    }
+    cpio.pack_trailer()
+        .map_err(|error| anyhow!("Failed to pack CPIO trailer: {error:?}"))?;
+
+    Ok(Some(cpio.into_inner()))
+}
+
+/// The image-specific drop-in directory the stub will scan for this stub
+/// binary, preferring the systemd-stub compatible name over the historical
+/// one, with any boot assessment counter removed.
+fn stub_dropin_directory(stub: &Path) -> Option<PathBuf> {
+    let parent = stub.parent()?;
+    let file_name = stub.file_name()?.to_str()?;
+
+    let preferred = match file_name.strip_suffix(".efi") {
+        Some(stem) => parent.join(format!(
+            "{}.efi.extra.d",
+            strip_automatic_boot_assessment_counter(stem)
+        )),
+        None => parent.join(format!(
+            "{}.extra.d",
+            strip_automatic_boot_assessment_counter(file_name)
+        )),
+    };
+    if preferred.is_dir() {
+        return Some(preferred);
+    }
+
+    let legacy = parent.join(format!("{file_name}.extra"));
+    legacy.is_dir().then_some(legacy)
+}
+
+/// Lock the global system extensions from the boot partition.
+///
+/// Returns the hash naming the written variant, or None when the boot
+/// partition carries no extensions and there is nothing to predict.
+pub fn lock_sysexts(args: LockSysextsArgs) -> Result<Option<LockResult>> {
+    let Some(cpio) = sysext_cpio(&args.esp.join("loader/extensions"), ".extra/global_sysext")?
+    else {
+        return Ok(None);
+    };
+
+    let cpio_hash = hex_string(&Sha256::digest(&cpio));
+    let pcrlock_path = resolve_pcrlock_path(&args.pcrlock, &cpio_hash);
+    if pcrlock_path.exists() {
+        return Ok(Some(LockResult { pe_hash: cpio_hash }));
+    }
+
+    let records = run_pcrlock(&args.systemd, &["lock-raw", "--pcr=13"], None, Some(&cpio))?;
+    write_pcrlock(&pcrlock_path, &records)?;
+    Ok(Some(LockResult { pe_hash: cpio_hash }))
 }
 
 /// Remove pcrlock variant files for PE binaries that are neither installed
@@ -255,6 +359,19 @@ fn generate_records(systemd: &Path, esp: &Path, stub: &Path) -> Result<Vec<Value
             &["lock-raw", "--pcr=11"],
             None,
             Some(section_bytes.as_ref()),
+        )?);
+    }
+
+    // The stub also measures the system extensions from its drop-in
+    // directory into PCR 13, as a single CPIO archive.
+    if let Some(dropin_dir) = stub_dropin_directory(stub)
+        && let Some(cpio) = sysext_cpio(&dropin_dir, ".extra/sysext")?
+    {
+        records.extend(run_pcrlock(
+            systemd,
+            &["lock-raw", "--pcr=13"],
+            None,
+            Some(&cpio),
         )?);
     }
 

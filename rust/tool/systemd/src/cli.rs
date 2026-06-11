@@ -32,6 +32,7 @@ enum Commands {
     LockBootLoader(LockBootLoaderCommand),
     LockThinStub(LockThinStubCommand),
     GcPcrlock(GcPcrlockCommand),
+    LockSysexts(LockSysextsCommand),
 }
 
 #[derive(Parser)]
@@ -120,6 +121,21 @@ struct LockBootLoaderCommand {
 }
 
 #[derive(Parser)]
+struct LockSysextsCommand {
+    /// Systemd path
+    #[arg(long)]
+    systemd: PathBuf,
+
+    /// EFI system partition mountpoint
+    #[arg(long)]
+    esp: PathBuf,
+
+    /// Output .pcrlock file path
+    #[arg(long)]
+    pcrlock: PathBuf,
+}
+
+#[derive(Parser)]
 struct GcPcrlockCommand {
     /// Systemd path
     #[arg(long)]
@@ -172,6 +188,17 @@ impl Commands {
                     stub: args.stub,
                 })?;
                 println!("{}", result.pe_hash);
+                Ok(())
+            }
+            Commands::LockSysexts(args) => {
+                let result = pcrlock::lock_sysexts(pcrlock::LockSysextsArgs {
+                    systemd: args.systemd,
+                    esp: args.esp,
+                    pcrlock: args.pcrlock,
+                })?;
+                if let Some(result) = result {
+                    println!("{}", result.pe_hash);
+                }
                 Ok(())
             }
             Commands::GcPcrlock(args) => pcrlock::gc(pcrlock::GcArgs {

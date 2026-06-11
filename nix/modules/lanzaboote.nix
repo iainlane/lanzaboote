@@ -70,21 +70,24 @@ let
     + lib.optionalString config.systemd.pcrlock.enable ''
       boot_loader_pcrlock_dir="/var/lib/pcrlock.d/640-boot-loader.pcrlock.d"
       boot_entry_pcrlock_dir="/var/lib/pcrlock.d/650-boot-entry.pcrlock.d"
-      mkdir -p "$boot_loader_pcrlock_dir" "$boot_entry_pcrlock_dir"
+      global_sysext_pcrlock_dir="/var/lib/pcrlock.d/655-global-sysext.pcrlock.d"
+      mkdir -p "$boot_loader_pcrlock_dir" "$boot_entry_pcrlock_dir" "$global_sysext_pcrlock_dir"
       declare -A current_boot_loader_hashes
       declare -A current_boot_entry_hashes
+      declare -A current_global_sysext_hashes
 
       # Back up the component directories so a failure below cannot leave
       # a half-updated set of predictions behind: the policy must be built
       # either from the complete old set or the complete new set.
       pcrlock_backup="$(mktemp -d)"
-      cp -a "$boot_loader_pcrlock_dir" "$boot_entry_pcrlock_dir" "$pcrlock_backup/"
+      cp -a "$boot_loader_pcrlock_dir" "$boot_entry_pcrlock_dir" "$global_sysext_pcrlock_dir" "$pcrlock_backup/"
       restore_pcrlock_components() {
         echo "error: pcrlock prediction update failed; restoring previous components." >&2
         echo "error: the TPM2 policy was not updated, so the next boot may ask for the fallback passphrase." >&2
-        rm -rf "$boot_loader_pcrlock_dir" "$boot_entry_pcrlock_dir"
+        rm -rf "$boot_loader_pcrlock_dir" "$boot_entry_pcrlock_dir" "$global_sysext_pcrlock_dir"
         cp -a "$pcrlock_backup/640-boot-loader.pcrlock.d" "$boot_loader_pcrlock_dir"
         cp -a "$pcrlock_backup/650-boot-entry.pcrlock.d" "$boot_entry_pcrlock_dir"
+        cp -a "$pcrlock_backup/655-global-sysext.pcrlock.d" "$global_sysext_pcrlock_dir"
         rm -rf "$pcrlock_backup"
       }
       trap restore_pcrlock_components ERR
@@ -118,6 +121,21 @@ let
         fi
       done
 
+      # Predict the PCR 13 measurement of the global system extensions.
+      # No output means the boot partition carries none, and nothing needs
+      # to be predicted.
+      if hash="$(${lib.getExe cfg.package} lock-sysexts \
+        --systemd ${config.systemd.package} \
+        --esp "${espMountPoint}" \
+        --pcrlock "$global_sysext_pcrlock_dir")"; then
+        if [ -n "$hash" ]; then
+          current_global_sysext_hashes["$hash"]=1
+        fi
+      else
+        lock_failed=1
+        echo "warning: global sysext pcrlock generation failed" >&2
+      fi
+
       # Only garbage-collect when every lock command succeeded: a transient
       # failure must not delete variants for binaries that are still
       # installed. gc-pcrlock additionally retains variants whose digests
@@ -141,6 +159,15 @@ let
           --systemd ${config.systemd.package} \
           --pcrlock "$boot_entry_pcrlock_dir" \
           "''${keep_boot_entry[@]}"
+
+        keep_global_sysext=()
+        for hash in "''${!current_global_sysext_hashes[@]}"; do
+          keep_global_sysext+=(--keep "$hash")
+        done
+        ${lib.getExe cfg.package} gc-pcrlock \
+          --systemd ${config.systemd.package} \
+          --pcrlock "$global_sysext_pcrlock_dir" \
+          "''${keep_global_sysext[@]}"
       fi
 
       # Remove empty directories to avoid zeroing predictions
@@ -150,6 +177,9 @@ let
       if [ -z "$(ls -A "$boot_entry_pcrlock_dir" 2>/dev/null)" ]; then
         rmdir "$boot_entry_pcrlock_dir" 2>/dev/null || true
       fi
+      if [ -z "$(ls -A "$global_sysext_pcrlock_dir" 2>/dev/null)" ]; then
+        rmdir "$global_sysext_pcrlock_dir" 2>/dev/null || true
+      fi
 
       # Update the NV index and ESP credential so the next boot can unlock.
       # Updating the NV index first unseals the recovery PIN under the old
@@ -158,7 +188,7 @@ let
       # update can run at any point. The boot-time make-policy service is
       # overridden to run the same command, so the two writers never
       # rewrite each other's prediction.
-      ${combinedMakePolicyCommand} --recovery-pin=no
+      ${combinedMakePolicyCommand}
 
       trap - ERR
       rm -rf "$pcrlock_backup"
@@ -188,26 +218,15 @@ let
     )}
   '';
 
-  # The pcrlock policy maintained next to a signed PCR 11 enrolment covers
-  # the firmware PCRs only. systemd-pcrlock refuses policies with more
-  # than eight alternative values per PCR, and PCR 11 takes one predicted
-  # value per boot entry and boot phase, so covering it would limit the
-  # ESP to two generations. The signed-policy shard of the LUKS enrolment
-  # pins PCR 11 instead, and it keeps working however many generations are
-  # installed.
+  # Shared by the install hook, the boot-time make-policy unit, and the
+  # fwupd re-lock service, so every writer of the policy produces the same
+  # prediction. See the pcrlockPcrs option for why PCR 11 is not covered.
   combinedMakePolicyCommand = lib.escapeShellArgs (
     [
       "${config.systemd.package}/lib/systemd/systemd-pcrlock"
       "make-policy"
     ]
-    ++ lib.map (pcr: "--pcr=${toString pcr}") [
-      0
-      1
-      2
-      3
-      4
-      7
-    ]
+    ++ lib.map (pcr: "--pcr=${toString pcr}") cfg.pcrlockPcrs
   );
 
   makePolicyCommand = lib.escapeShellArgs (
@@ -364,6 +383,44 @@ in
         '';
         default = true;
       };
+    };
+
+    pcrlockPcrs = lib.mkOption {
+      type = lib.types.listOf (
+        lib.types.enum [
+          0
+          1
+          2
+          3
+          4
+          5
+          7
+          13
+          14
+          15
+        ]
+      );
+      default = [
+        0
+        1
+        2
+        3
+        4
+        7
+        13
+        15
+      ];
+      description = ''
+        PCRs the systemd-pcrlock policy covers when `systemd.pcrlock.enable`
+        drives the install hook.
+
+        PCR 11 is intentionally not allowed here: systemd-pcrlock refuses
+        policies with more than eight alternative values per PCR, and PCR 11
+        takes one predicted value per boot entry and boot phase, so covering
+        it would limit the ESP to two generations. Bind PCR 11 through the
+        signed policy shard (`pcrSigning`) instead, which keeps working
+        however many generations are installed.
+      '';
     };
 
     logLevel = lib.mkOption {
@@ -878,7 +935,7 @@ in
             Type = "oneshot";
             ExecStart = [
               "${config.systemd.package}/lib/systemd/systemd-pcrlock unlock-firmware-code"
-              "${combinedMakePolicyCommand} --recovery-pin=no"
+              combinedMakePolicyCommand
             ];
           };
           unitConfig = {

@@ -1,4 +1,4 @@
-{ ... }:
+{ pkgs, ... }:
 
 {
   name = "lanzaboote-pcrlock";
@@ -60,7 +60,6 @@
 
       with subtest("Install hook refreshes thin-stub policy successfully"):
         machine.succeed("${installHook}")
-        machine.succeed("${systemd}/lib/systemd/systemd-pcrlock make-policy --recovery-pin=no --location=770")
 
       with subtest("NV index was created in TPM"):
         # list-components proves systemd-pcrlock can talk to the TPM and read its state
@@ -107,6 +106,14 @@
         assert isinstance(predictions, (dict, list)), "Predictions output is not valid JSON after reboot"
         assert len(predictions) > 0, "Predictions are empty after reboot"
         print(json.dumps(predictions, indent=2)[:500])
-        assert 11 in collect_pcr_indices(predictions), "PCR 11 missing from predictions after reboot"
+        pcrs = collect_pcr_indices(predictions)
+        assert {0, 1, 2, 3, 4, 7} <= pcrs, f"firmware PCRs missing from predictions after reboot: {sorted(pcrs)}"
+        policy_pcrs = set(json.loads(machine.succeed(
+          """${pkgs.jq}/bin/jq -c '[.pcrValues[].pcr] | unique' /var/lib/systemd/pcrlock.json"""
+        )))
+        assert policy_pcrs == {0, 1, 2, 3, 4, 7, 13, 15}, (
+          f"policy must cover exactly the firmware PCRs, leaving PCR 11 to "
+          f"the signed policy shard: {sorted(policy_pcrs)}"
+        )
     '';
 }

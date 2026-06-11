@@ -1,4 +1,4 @@
-{ ... }:
+{ pkgs, ... }:
 
 {
   name = "lanzaboote-pcrlock-rollforward";
@@ -72,11 +72,57 @@
         predict_raw = machine.succeed("${systemd}/lib/systemd/systemd-pcrlock predict --json=short")
         predictions = json.loads(predict_raw)
         assert len(predictions) > 0, "Empty predictions on gen1 boot"
-        assert 11 in collect_pcr_indices(predictions), "PCR 11 missing from gen1 predictions"
+        gen1_pcrs = collect_pcr_indices(predictions)
+        assert {0, 1, 2, 3, 4, 7} <= gen1_pcrs, f"firmware PCRs missing from gen1 predictions: {sorted(gen1_pcrs)}"
+        policy_pcrs = set(json.loads(machine.succeed(
+          """${pkgs.jq}/bin/jq -c '[.pcrValues[].pcr] | unique' /var/lib/systemd/pcrlock.json"""
+        )))
+        assert policy_pcrs == {0, 1, 2, 3, 4, 7, 13, 15}, (
+          f"policy must cover exactly the firmware PCRs, leaving PCR 11 to "
+          f"the signed policy shard: {sorted(policy_pcrs)}"
+        )
 
       with subtest("Install hook keeps thin-stub policy refreshable on gen1"):
         machine.succeed("${installHook}")
-        machine.succeed("${systemd}/lib/systemd/systemd-pcrlock make-policy --recovery-pin=no --location=770")
+
+      # Validate the prediction parity of the historical drop-in directory
+      # by giving the running generation a sysext through it and rebooting:
+      # the policy can only keep covering PCR 13 if the predicted archive
+      # matches what the stub measures.
+      with subtest("Legacy .extra sysexts are predicted for the running generation"):
+        gen1_stub = machine.succeed(
+          "ls /boot/EFI/Linux/nixos-generation-1-*.efi | grep -v specialisation | head -n1"
+        ).strip()
+        machine.succeed(f"mkdir -p {gen1_stub}.extra")
+        machine.succeed(f"dd if=/dev/urandom of={gen1_stub}.extra/local.sysext.raw bs=1024 count=4")
+        machine.succeed("${installHook}")
+        machine.succeed("sync")
+
+      machine.reboot()
+
+      with subtest("Policy still covers PCR 13 after rebooting with the legacy sysext"):
+        machine.wait_for_unit("multi-user.target")
+        machine.wait_for_unit("${policyService}")
+        policy_pcrs = set(json.loads(machine.succeed(
+          """${pkgs.jq}/bin/jq -c '[.pcrValues[].pcr] | unique' /var/lib/systemd/pcrlock.json"""
+        )))
+        assert 13 in policy_pcrs, (
+          f"PCR 13 dropped: legacy drop-in prediction does not match the stub: {sorted(policy_pcrs)}"
+        )
+
+      # The preferred drop-in directory form, and the global extensions
+      # directory, are validated across the switch to gen2.
+      with subtest("System extensions are predicted before the switch"):
+        machine.succeed("mkdir -p /boot/loader/extensions")
+        machine.succeed("dd if=/dev/urandom of=/boot/loader/extensions/global.raw bs=1024 count=4")
+        stub = machine.succeed(
+          "ls /boot/EFI/Linux/nixos-generation-1-specialisation-gen2-*.efi | head -n1"
+        ).strip()
+        dropin = stub.removesuffix(".efi") + ".efi.extra.d"
+        machine.succeed(f"mkdir -p {dropin}")
+        machine.succeed(f"dd if=/dev/urandom of={dropin}/local.sysext.raw bs=1024 count=4")
+        machine.succeed("${installHook}")
+        machine.succeed("ls /var/lib/pcrlock.d/655-global-sysext.pcrlock.d/*.pcrlock")
 
       with subtest("Switch default boot entry to gen2 specialisation"):
         machine.succeed(
@@ -98,8 +144,9 @@
           "Predictions output is not valid JSON after reboot into gen2"
         )
         assert len(predictions) > 0, "Empty predictions after reboot into gen2"
-        assert 11 in collect_pcr_indices(predictions), (
-          f"PCR 11 missing after reboot into gen2: {sorted(collect_pcr_indices(predictions))}"
+        gen2_pcrs = collect_pcr_indices(predictions)
+        assert {0, 1, 2, 3, 4, 7} <= gen2_pcrs, (
+          f"firmware PCRs missing after reboot into gen2: {sorted(gen2_pcrs)}"
         )
 
       with subtest("Running generation is the gen2 specialisation"):
