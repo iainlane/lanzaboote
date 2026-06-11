@@ -60,6 +60,7 @@
         in
         import ./. {
           inherit system pkgs rust-overlay;
+          useMeasuredBootTpm2Module = false;
           crane = crane.mkLib pkgs;
         }
       );

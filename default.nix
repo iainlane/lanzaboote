@@ -2,6 +2,7 @@
   system ? builtins.currentSystem,
   sources ? import ./sources.nix,
   rust-overlay ? sources.rust-overlay,
+  useMeasuredBootTpm2Module ? true,
   pkgs ? import sources.nixpkgs {
     inherit system;
   },
@@ -59,15 +60,18 @@ rec {
     tests = lib.recurseIntoAttrs (
       import ./nix/tests {
         inherit pkgs;
-        extraBaseModules = {
-          inherit (nixosModules) lanzaboote;
-          measuredBootTpm2 = {
-            disabledModules = [ "system/boot/systemd/tpm2.nix" ];
-            imports = [
-              "${sources.nixpkgs-measured-boot}/nixos/modules/system/boot/systemd/tpm2.nix"
-            ];
+        extraBaseModules =
+          {
+            inherit (nixosModules) lanzaboote;
+          }
+          // lib.optionalAttrs useMeasuredBootTpm2Module {
+            measuredBootTpm2 = {
+              disabledModules = [ "system/boot/systemd/tpm2.nix" ];
+              imports = [
+                "${sources.nixpkgs-measured-boot}/nixos/modules/system/boot/systemd/tpm2.nix"
+              ];
+            };
           };
-        };
       }
     );
   };
