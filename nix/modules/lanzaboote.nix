@@ -240,6 +240,161 @@ let
     ]
     ++ lib.map (pcr: "--pcr=${toString pcr}") cfg.measuredBoot.pcrs
   );
+
+  autoCryptenrollCfg = cfg.measuredBoot.autoCryptenroll;
+
+  autoCryptenrollDevice =
+    if autoCryptenrollCfg.volume != null then
+      config.boot.initrd.luks.devices.${autoCryptenrollCfg.volume}.device
+    else
+      autoCryptenrollCfg.device;
+
+  # The kernel keyring description under which the unlocked volume key is
+  # linked, shared between the crypttab entry that links it and the
+  # enrolment service that consumes it.
+  volumeKeyDescription = "lanzaboote-autoenroll";
+
+  autoCryptenrollScript = pkgs.writeShellApplication {
+    name = "lanzaboote-auto-cryptenroll";
+
+    runtimeInputs = [
+      config.systemd.package
+      pkgs.coreutils
+      pkgs.cryptsetup
+      pkgs.jq
+      pkgs.keyutils
+    ];
+
+    text = ''
+      device=${lib.escapeShellArg (toString autoCryptenrollDevice)}
+      vk_desc=${lib.escapeShellArg volumeKeyDescription}
+
+      tmp_keyfile=""
+
+      cleanup() {
+        if [ -n "$tmp_keyfile" ] && [ -e "$tmp_keyfile" ]; then
+          cryptsetup luksRemoveKey "$device" "$tmp_keyfile" || true
+          rm -f "$tmp_keyfile"
+        fi
+
+        # The volume key only needs to stay in the keyring long enough for
+        # enrolment. Drop it whether or not it was used.
+        key_id=$(keyctl search @u user "$vk_desc" 2>/dev/null) || return 0
+        keyctl unlink "$key_id" @u || true
+      }
+      trap cleanup EXIT
+
+      if [ ! -e "$device" ]; then
+        echo "$device does not exist, nothing to enrol."
+        exit 0
+      fi
+
+      tokens() {
+        cryptsetup luksDump --dump-json-metadata "$device" \
+          | jq '[.tokens[]? | select(.type == "systemd-tpm2")]'
+      }
+
+      unlocked() {
+        resolved=$(readlink -f "$device")
+        holders=/sys/class/block/$(basename "$resolved")/holders
+        [ -n "$(ls -A "$holders" 2>/dev/null)" ]
+      }
+
+      keyring_has_volume_key() {
+        keyctl search @u user "$vk_desc" >/dev/null 2>&1
+      }
+
+      # A token is only usable if it references the NV index of the current
+      # policy: removing and re-making the policy allocates a new index and
+      # strands any token enrolled against the old one. The token records
+      # the policy's nvHandle verbatim at enrolment time.
+      healthy() {
+        expected_nv=$(jq -r '.nvHandle // empty' ${cfg.measuredBoot.pcrlockPolicy} 2>/dev/null || true)
+        [ -n "$expected_nv" ] || return 1
+        tokens | jq -e --arg nv "$expected_nv" '
+          [.[] | (.tpm2_pcrlock == true) and (.tpm2_pcrlock_nv == $nv)${lib.optionalString cfg.pcrSigning.enable " and (.tpm2_pubkey_pcrs == [11])"}] | any
+        ' >/dev/null
+      }
+
+      # When the boot-time policy update failed, the policy in the NV index
+      # can no longer authorise its own replacement; PCR state has drifted
+      # outside anything that was predicted, and the recovery PIN is sealed
+      # behind the same policy. The volume key is the stronger credential:
+      # whoever could unlock the volume may discard the dead policy and
+      # start afresh.
+      policy_stuck=""
+      if systemctl is-failed --quiet systemd-pcrlock-make-policy.service 2>/dev/null; then
+        policy_stuck=1
+      fi
+
+      if [ -z "$policy_stuck" ] && healthy; then
+        echo "$device already has a TPM2 token with the expected policy shards, nothing to do."
+        exit 0
+      fi
+
+      if [ -n "$policy_stuck" ]; then
+        if ! keyring_has_volume_key; then
+          echo "The boot-time pcrlock policy update failed and no volume key is available to reset it." >&2
+          echo "Unlock $device with a passphrase or key file during boot to recover automatically." >&2
+          exit 1
+        fi
+
+        echo "The boot-time pcrlock policy update failed; discarding the stale policy and starting afresh."
+        ${config.systemd.package}/lib/systemd/systemd-pcrlock remove-policy || true
+      fi
+
+      # Refresh the artifacts on the ESP and the pcrlock policy, so the
+      # enrolment binds to the boot stack as it is now.
+      ${installHook}/bin/lzbt
+
+      if [ -z "$policy_stuck" ] && healthy; then
+        echo "The TPM2 token on $device matches the refreshed policy, nothing to do."
+        exit 0
+      fi
+
+      enroll_args=(
+        --wipe-slot=tpm2
+        --tpm2-device=auto
+        --tpm2-pcrlock=${cfg.measuredBoot.pcrlockPolicy}
+      )
+      ${lib.optionalString cfg.pcrSigning.enable ''
+        enroll_args+=(
+          --tpm2-public-key=${lib.escapeShellArg (toString cfg.pcrSigning.publicKeyFile)}
+          --tpm2-public-key-pcrs=11
+        )
+      ''}
+
+      enroll() {
+        systemd-cryptenroll "$1" "''${enroll_args[@]}" "$device"
+      }
+
+      if [ -z "$policy_stuck" ] && tokens | jq -e 'length > 0' >/dev/null && enroll --unlock-tpm2-device=auto; then
+        echo "Re-enrolled the TPM2 token on $device using the existing enrolment."
+      elif ! unlocked && ! keyring_has_volume_key; then
+        # A locked volume holds no credential to enrol with; the next boot
+        # that unlocks it will enrol.
+        echo "$device is not unlocked, nothing to enrol from."
+        exit 0
+      elif keyring_has_volume_key; then
+        # The volume key was linked into the kernel keyring when the volume
+        # was unlocked earlier in this boot. systemd-cryptenroll cannot read
+        # it from there, so mint a transient key slot with it and enrol
+        # through that.
+        tmp_keyfile=$(mktemp /run/lanzaboote-auto-cryptenroll.XXXXXX)
+        head -c 32 /dev/urandom >"$tmp_keyfile"
+        cryptsetup luksAddKey --volume-key-keyring "%user:$vk_desc" "$device" "$tmp_keyfile"
+
+        enroll --unlock-key-file="$tmp_keyfile"
+        echo "Enrolled a TPM2 token on $device using the volume key from the kernel keyring."
+      else
+        echo "$device is unlocked, but its volume key was not linked into the kernel keyring." >&2
+        echo "Check the link-volume-key option on its crypttab entry, or run systemd-cryptenroll manually." >&2
+        exit 1
+      fi
+
+      ${lib.optionalString autoCryptenrollCfg.autoReboot "systemctl reboot"}
+    '';
+  };
 in
 {
   imports = [
@@ -602,7 +757,7 @@ in
       };
 
       autoCryptenroll = {
-        enable = lib.mkEnableOption "automatically re-enroll systemd-pcrlock TPM2 policy into LUKS volume";
+        enable = lib.mkEnableOption "automatically enrolling the TPM2 policy into a LUKS volume";
 
         device = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
@@ -610,21 +765,39 @@ in
           description = ''
             The device that is encrypted via LUKS2 to enroll the TPM2 policy into.
 
-            This is useful for unattended systems to upgrade a LUKS2 volume
-            from being locked against a static PCR to a full systemd-pcrlock
-            policy.
+            With a plain device path, enrolment can only proceed when an
+            existing TPM2 enrolment can unlock the volume, for example to
+            upgrade from a static PCR binding to the full policy. Use
+            {option}`volume` instead to also enrol volumes that were
+            unlocked with a passphrase or key file.
+          '';
+        };
+
+        volume = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = ''
+            The name of an entry in {option}`boot.initrd.luks.devices` to
+            enroll the TPM2 policy into.
+
+            Unlike {option}`device`, this also wires up the volume so that
+            its key is available for enrolment after any successful unlock,
+            including by passphrase or key file. A volume that is not yet
+            enrolled is then enrolled automatically on the first boot after
+            it was unlocked, without storing any secret: possession of the
+            unlocked volume is the credential.
           '';
         };
 
         autoReboot = lib.mkEnableOption "" // {
           description = ''
-            Whether to automatically reboot after preparing the measurements.
+            Whether to automatically reboot after a volume was enrolled.
 
-            Enable this to enroll the new systemd-pcrlock policy with full
-            protection without having to wait for a manual reboot.
-
-            When you combine this with automatically provisioning Secure Boot,
-            you generally don't need to reboot after autoCryptenroll.
+            Enrolment can shift the firmware PCR predictions, so the boot
+            after it may need the fallback credential once before the policy
+            settles. Enabling this absorbs that boot immediately rather than
+            leaving it for the next manual reboot. Boots where the volume is
+            already enrolled never reboot.
           '';
         };
       };
@@ -641,6 +814,17 @@ in
             You have two options:
             1. Include the Microsoft keys via autoEnrollKeys.includeMicrosoftKeys
             2. Accept the risk via autoEnrollKeys.allowBrickingMyMachine
+        '';
+      }
+      {
+        assertion =
+          autoCryptenrollCfg.enable
+          -> ((autoCryptenrollCfg.device != null) != (autoCryptenrollCfg.volume != null));
+        message = ''
+          boot.lanzaboote.measuredBoot.autoCryptenroll requires exactly one of
+          `device` (a plain device path, re-enrolment via an existing TPM2
+          token only) or `volume` (a boot.initrd.luks.devices entry, also
+          enables enrolment after a passphrase or key file unlock).
         '';
       }
       {
@@ -841,39 +1025,34 @@ in
         '';
     };
 
-    systemd.services.auto-cryptenroll = lib.mkIf cfg.measuredBoot.autoCryptenroll.enable {
-      wantedBy = [ "multi-user.target" ];
-
-      unitConfig = {
-        ConditionPathExists = [
-          # If this path exists the new policy was already enrolled and thus
-          # does not need to be enrolled again. systemd-pcrlock will update the
-          # policy in place in the same NV index of the TPM.
-          "!/var/lib/auto-cryptenroll/1"
+    # Link the volume key into the kernel keyring on every successful
+    # unlock, so the enrolment service can use it as the credential. The
+    # service unlinks it again once it has run.
+    boot.initrd.luks.devices = lib.mkIf autoCryptenrollCfg.enable (
+      lib.optionalAttrs (autoCryptenrollCfg.volume != null) {
+        ${autoCryptenrollCfg.volume}.crypttabExtraOpts = [
+          "link-volume-key=@u::%user:${volumeKeyDescription}"
         ];
-        ConditionSecurity = lib.mkIf cfg.autoEnrollKeys.enable "uefi-secureboot";
-        SuccessAction = lib.mkIf cfg.measuredBoot.autoCryptenroll.autoReboot "reboot";
-      };
+      }
+    );
+
+    systemd.services.auto-cryptenroll = lib.mkIf autoCryptenrollCfg.enable {
+      description = "Enroll the TPM2 policy into the LUKS volume";
+
+      wantedBy = [ "multi-user.target" ];
+      after = [ "systemd-pcrlock-make-policy.service" ];
+
+      unitConfig.ConditionSecurity = lib.mkIf cfg.autoEnrollKeys.enable "uefi-secureboot";
 
       serviceConfig = {
         Type = "oneshot";
-        # SuccessAction doesn't trigger if the service is RemainAfterExit
-        RemainAfterExit = lib.mkIf (!cfg.measuredBoot.autoCryptenroll.autoReboot) true;
-        StateDirectory = "auto-cryptenroll";
-        ExecStart = [
-          # Re-create all artifacts on the ESP to generate pcrlock measurements
-          # for PCR 4. This will also create a new pcrlock policy.
-          "${installHook}/bin/lzbt"
-          ''
-            systemd-cryptenroll \
-              --wipe-slot=tpm2 \
-              --tpm2-device=auto \
-              --unlock-tpm2-device=auto \
-              --tpm2-pcrlock=${cfg.measuredBoot.pcrlockPolicy} \
-              ${cfg.measuredBoot.autoCryptenroll.device}
-          ''
-        ];
-        ExecStartPost = "${pkgs.coreutils}/bin/touch /var/lib/auto-cryptenroll/1";
+        RemainAfterExit = true;
+        # The volume key in the root user keyring is only readable by a
+        # possessor. The default private keyring mode gives the service a
+        # session keyring with no link to the user keyring, so possession
+        # never applies; the shared mode links it up.
+        KeyringMode = "shared";
+        ExecStart = lib.getExe autoCryptenrollScript;
       };
     };
 

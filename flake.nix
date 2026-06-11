@@ -115,12 +115,14 @@
         }
         // builtins.removeAttrs checks.tests [
           "recurseForDerivations"
+          "luks-tpm2-autoenroll"
           "luks-tpm2-combined"
           "pcrlock"
           "pcrlock-rollforward"
         ]
         // {
           inherit (measuredBootChecks.tests)
+            luks-tpm2-autoenroll
             luks-tpm2-combined
             pcrlock
             pcrlock-rollforward
