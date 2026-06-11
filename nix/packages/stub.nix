@@ -7,12 +7,15 @@
 
 buildRustApp {
   pname = "lanzaboote-stub";
-  src = lib.sourceFilesBySuffices ../../rust/uefi [
+  src = lib.sourceFilesBySuffices ../../rust [
     ".rs"
     ".toml"
     ".lock"
   ];
   args = {
+    sourceRoot = "source/uefi";
+    cargoToml = ../../rust/uefi/Cargo.toml;
+    cargoLock = ../../rust/uefi/Cargo.lock;
     CARGO_BUILD_TARGET = "${stdenv.hostPlatform.qemuArch}-unknown-uefi";
     doCheck = false;
 

@@ -21,6 +21,7 @@ bitflags = "2.10.0"
 goblin = { version = "0.10", default-features = false, features = [ "pe64", "alloc" ]}
 
 pio = { path = "../pio" }
+lanzaboote_shared = { path = "../../shared" }
 
 [badges]
 maintenance = { status = "actively-developed" }

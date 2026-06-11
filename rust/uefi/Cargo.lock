@@ -96,6 +96,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lanzaboote_shared"
+version = "1.0.0"
+
+[[package]]
 name = "lanzaboote_stub"
 version = "1.0.0"
 dependencies = [
@@ -117,6 +121,7 @@ version = "1.0.0"
 dependencies = [
  "bitflags",
  "goblin",
+ "lanzaboote_shared",
  "log",
  "pio",
  "uefi",

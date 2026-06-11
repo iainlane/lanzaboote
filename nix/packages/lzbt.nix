@@ -10,7 +10,7 @@
 
 buildRustApp {
   pname = "lzbt-systemd";
-  src = lib.sourceFilesBySuffices ../../rust/tool [
+  src = lib.sourceFilesBySuffices ../../rust [
     ".rs"
     ".toml"
     ".lock"
@@ -18,6 +18,11 @@ buildRustApp {
     ".pem"
     ".key"
   ];
+  args = {
+    sourceRoot = "source/tool";
+    cargoToml = ../../rust/tool/Cargo.toml;
+    cargoLock = ../../rust/tool/Cargo.lock;
+  };
   packageArgs = {
     nativeBuildInputs = [
       makeBinaryWrapper

@@ -3,9 +3,9 @@ use crate::{
     efivars::BOOT_LOADER_VENDOR_UUID,
     tpm::{tpm_log_event_ascii, tpm_log_event_utf16},
     uefi_helpers::{ParsedPe, PeInMemory},
-    unified_sections::UnifiedSection,
 };
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
+use lanzaboote_shared::unified_sections::{UnifiedSection, UnifiedSectionDataSource};
 use log::info;
 use uefi::{
     cstr16,
@@ -30,12 +30,6 @@ pub const TPM_PCR_INDEX_KERNEL_IMAGE: PcrIndex = PcrIndex(11);
 pub const TPM_PCR_INDEX_KERNEL_CONFIG: PcrIndex = PcrIndex(12);
 /// This is where we extend the initrd sysext images into which we pass to the booted kernel
 pub const TPM_PCR_INDEX_SYSEXTS: PcrIndex = PcrIndex(13);
-
-/// Measure arbitrary data into PCR 4 via an IPL event.
-pub fn measure_boot_loader(buffer: &[u8], description: &str) -> uefi::Result<()> {
-    tpm_log_event_ascii(TPM_PCR_INDEX_BOOT_LOADER, buffer, description)?;
-    Ok(())
-}
 
 fn encode_pcr_index(pcr_index: PcrIndex) -> Vec<u8> {
     let mut encoded = pcr_index
@@ -68,6 +62,12 @@ fn ensure_utf16_bytes_with_nul(bytes: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+/// Measure arbitrary data into PCR 4 via an IPL event.
+pub fn measure_boot_loader(buffer: &[u8], description: &str) -> uefi::Result<()> {
+    tpm_log_event_ascii(TPM_PCR_INDEX_BOOT_LOADER, buffer, description)?;
+    Ok(())
+}
+
 pub fn measure_image(
     image: &PeInMemory,
     kernel_data: &[u8],
@@ -76,7 +76,7 @@ pub fn measure_image(
     let pe = ParsedPe::from_pe_in_memory(image)?;
     // Build a list of unified_sections and sort by canonical order.
     // Per UKI spec: "shall measure the sections listed above, starting from the .linux section,
-    // in the order as listed (which should be considered the canonical order).
+    // in the order as listed (which should be considered the canonical order)."
     let mut sections_to_measure = Vec::new();
     for section_name in pe.sections() {
         if let Ok(unified_section) = UnifiedSection::try_from(section_name) {
@@ -92,23 +92,23 @@ pub fn measure_image(
         let section_name = unified_section.name();
 
         let section_data = pe.section_data(section_name);
-        let data = match unified_section {
-            UnifiedSection::Linux => Some(kernel_data),
-            UnifiedSection::Initrd => Some(initrd_data),
-            _ => section_data.as_deref(),
+        // Use kernel/initrd data that were loaded from file system to match systemd-stub's measuring
+        let data = match unified_section.data_source() {
+            UnifiedSectionDataSource::ExternalKernel => Some(kernel_data),
+            UnifiedSectionDataSource::ExternalInitrd => Some(initrd_data),
+            UnifiedSectionDataSource::Embedded => section_data.as_deref(),
         };
 
         if let Some(data) = data {
             info!("Measuring section `{}`...", section_name);
 
+            // 1. "The section name in ASCII (including one trailing NUL byte)"
             let section_name_ascii = alloc::format!("{}\0", section_name);
             if tpm_log_event_ascii(
                 TPM_PCR_INDEX_KERNEL_IMAGE,
                 section_name_ascii.as_bytes(),
                 section_name,
-            )
-            .is_ok()
-            {
+            )? {
                 measurements += 1;
             }
 
