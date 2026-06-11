@@ -34,6 +34,14 @@ let
           "--public-key=${toString cfg.publicKeyFile}"
           "--private-key=${toString cfg.privateKeyFile}"
         ]
+        # The PCR signing keys are passed here rather than in
+        # `installCommand` so that image builds can supply their own
+        # build-time keys: the configured private key is an external path
+        # that only exists on the running system.
+        ++ lib.optionals cfg.pcrSigning.enable [
+          "--pcr-private-key=${toString cfg.pcrSigning.privateKeyFile}"
+          "--pcr-public-key=${toString cfg.pcrSigning.publicKeyFile}"
+        ]
         ++ lib.optionals (cfg.measuredBoot.enable && pcr 4) [
           "--pcrlock-directory=${cfg.measuredBoot.pcrlockDirectory}"
         ]
@@ -46,65 +54,114 @@ let
 
   installHook = pkgs.writeShellScriptBin "lzbt" (
     ''
+      set -euo pipefail
+
       ${lib.concatStringsSep "\n" (map mkInstallCommand efiSysMountPoints)}
     ''
     + lib.optionalString cfg.measuredBoot.enable ''
       echo "Predicting the PCR state for future boots..."
       ${makePolicyCommand}
     ''
-    # lock-pe: predict PCR 4 for all installed boot PE binaries.
-    # Each unique PE binary gets a .pcrlock variant file under prefix
-    # 775, which falls inside the upstream systemd-pcrlock-make-policy
-    # service's --location=770 range. The service updates the NV index
-    # at next boot; the hook should be initialised manually the first
-    # time (systemd-pcrlock make-policy --recovery-pin=show).
+    # Generate pcrlock predictions for the boot loader and all installed
+    # thin stubs.  Component IDs follow the well-known numbering from
+    # systemd.pcrlock(5): 640 for the boot loader PE (PCR 4) and 650 for
+    # each boot entry's thin stub (PCR 4 + PCR 11).  These sit in the
+    # standard range covered by the vendor make-policy --location=770.
     + lib.optionalString config.systemd.pcrlock.enable ''
-      pcrlock_dir="/var/lib/pcrlock.d/775-boot-entry.pcrlock.d"
-      mkdir -p "$pcrlock_dir"
-      declare -A current_hashes
+      boot_loader_pcrlock_dir="/var/lib/pcrlock.d/640-boot-loader.pcrlock.d"
+      boot_entry_pcrlock_dir="/var/lib/pcrlock.d/650-boot-entry.pcrlock.d"
+      mkdir -p "$boot_loader_pcrlock_dir" "$boot_entry_pcrlock_dir"
+      declare -A current_boot_loader_hashes
+      declare -A current_boot_entry_hashes
 
-      lock_pe_file() {
-        local pe_file="$1"
-        local hash
-        hash="$(sha256sum "$pe_file" | cut -d' ' -f1)"
-        current_hashes["$hash"]=1
-        if [ ! -f "$pcrlock_dir/$hash.pcrlock" ]; then
-          ${config.systemd.package}/lib/systemd/systemd-pcrlock lock-pe \
-            --pcrlock="$pcrlock_dir/$hash.pcrlock" "$pe_file" || \
-            echo "warning: lock-pe failed for $pe_file" >&2
-        fi
+      # Back up the component directories so a failure below cannot leave
+      # a half-updated set of predictions behind: the policy must be built
+      # either from the complete old set or the complete new set.
+      pcrlock_backup="$(mktemp -d)"
+      cp -a "$boot_loader_pcrlock_dir" "$boot_entry_pcrlock_dir" "$pcrlock_backup/"
+      restore_pcrlock_components() {
+        echo "error: pcrlock prediction update failed; restoring previous components." >&2
+        echo "error: the TPM2 policy was not updated, so the next boot may ask for the fallback passphrase." >&2
+        rm -rf "$boot_loader_pcrlock_dir" "$boot_entry_pcrlock_dir"
+        cp -a "$pcrlock_backup/640-boot-loader.pcrlock.d" "$boot_loader_pcrlock_dir"
+        cp -a "$pcrlock_backup/650-boot-entry.pcrlock.d" "$boot_entry_pcrlock_dir"
+        rm -rf "$pcrlock_backup"
       }
+      trap restore_pcrlock_components ERR
 
-      # lock-pe systemd-boot (glob handles x64/aa64/etc.)
-      for bootloader in "${espMountPoint}/EFI/systemd/systemd-boot"*".efi"; do
-        [ -f "$bootloader" ] || continue
-        lock_pe_file "$bootloader"
-      done
+      lock_failed=0
 
-      # lock-pe all lanzaboote stubs
+      # lock-boot-loader discovers the bootloader, computes the PE hash,
+      # skips if the output already exists, and prints the hash to stdout.
+      if hash="$(${lib.getExe cfg.package} lock-boot-loader \
+        --systemd ${config.systemd.package} \
+        --esp "${espMountPoint}" \
+        --pcrlock "$boot_loader_pcrlock_dir")"; then
+        current_boot_loader_hashes["$hash"]=1
+      else
+        lock_failed=1
+        echo "warning: systemd-boot pcrlock generation failed" >&2
+      fi
+
+      # Generate PCR 4 + PCR 11 variants for all lanzaboote thin stubs.
       for stub in "${espMountPoint}/EFI/Linux/nixos-"*".efi"; do
         [ -f "$stub" ] || continue
-        lock_pe_file "$stub"
-      done
-
-      # GC: remove .pcrlock files for PE hashes no longer on ESP
-      for old in "$pcrlock_dir"/*.pcrlock; do
-        [ -f "$old" ] || continue
-        hash="$(basename "$old" .pcrlock)"
-        if [ -z "''${current_hashes[$hash]+x}" ]; then
-          rm -f "$old"
+        if hash="$(${lib.getExe cfg.package} lock-thin-stub \
+          --systemd ${config.systemd.package} \
+          --esp "${espMountPoint}" \
+          --pcrlock "$boot_entry_pcrlock_dir" \
+          "$stub")"; then
+          current_boot_entry_hashes["$hash"]=1
+        else
+          lock_failed=1
+          echo "warning: thin-stub pcrlock generation failed for $stub" >&2
         fi
       done
 
-      # Remove empty directory to avoid zeroing predictions
-      if [ -z "$(ls -A "$pcrlock_dir" 2>/dev/null)" ]; then
-        rmdir "$pcrlock_dir" 2>/dev/null || true
+      # Only garbage-collect when every lock command succeeded: a transient
+      # failure must not delete variants for binaries that are still
+      # installed. gc-pcrlock additionally retains variants whose digests
+      # appear in the current TPM event log, so the booted state stays
+      # recognised by the policy even after its binary leaves the ESP.
+      if [ "$lock_failed" -eq 0 ]; then
+        keep_boot_loader=()
+        for hash in "''${!current_boot_loader_hashes[@]}"; do
+          keep_boot_loader+=(--keep "$hash")
+        done
+        ${lib.getExe cfg.package} gc-pcrlock \
+          --systemd ${config.systemd.package} \
+          --pcrlock "$boot_loader_pcrlock_dir" \
+          "''${keep_boot_loader[@]}"
+
+        keep_boot_entry=()
+        for hash in "''${!current_boot_entry_hashes[@]}"; do
+          keep_boot_entry+=(--keep "$hash")
+        done
+        ${lib.getExe cfg.package} gc-pcrlock \
+          --systemd ${config.systemd.package} \
+          --pcrlock "$boot_entry_pcrlock_dir" \
+          "''${keep_boot_entry[@]}"
+      fi
+
+      # Remove empty directories to avoid zeroing predictions
+      if [ -z "$(ls -A "$boot_loader_pcrlock_dir" 2>/dev/null)" ]; then
+        rmdir "$boot_loader_pcrlock_dir" 2>/dev/null || true
+      fi
+      if [ -z "$(ls -A "$boot_entry_pcrlock_dir" 2>/dev/null)" ]; then
+        rmdir "$boot_entry_pcrlock_dir" 2>/dev/null || true
       fi
 
       # Update the NV index and ESP credential so the next boot can unlock.
-      # Uses the same --location as the upstream service unit
-      # (--location=770) to produce identical predictions.
-      ${config.systemd.package}/lib/systemd/systemd-pcrlock make-policy --recovery-pin=no --location=770 || echo "warning: systemd-pcrlock make-policy failed; pcrlock policy may be stale" >&2
+      # Updating the NV index first unseals the recovery PIN under the old
+      # policy, so the old policy must be satisfiable here, at switch time.
+      # The firmware PCRs it covers are stable for the entire boot, so the
+      # update can run at any point. The boot-time make-policy service is
+      # overridden to run the same command, so the two writers never
+      # rewrite each other's prediction.
+      ${combinedMakePolicyCommand} --recovery-pin=no
+
+      trap - ERR
+      rm -rf "$pcrlock_backup"
     ''
   );
 
@@ -131,6 +188,28 @@ let
     )}
   '';
 
+  # The pcrlock policy maintained next to a signed PCR 11 enrolment covers
+  # the firmware PCRs only. systemd-pcrlock refuses policies with more
+  # than eight alternative values per PCR, and PCR 11 takes one predicted
+  # value per boot entry and boot phase, so covering it would limit the
+  # ESP to two generations. The signed-policy shard of the LUKS enrolment
+  # pins PCR 11 instead, and it keeps working however many generations are
+  # installed.
+  combinedMakePolicyCommand = lib.escapeShellArgs (
+    [
+      "${config.systemd.package}/lib/systemd/systemd-pcrlock"
+      "make-policy"
+    ]
+    ++ lib.map (pcr: "--pcr=${toString pcr}") [
+      0
+      1
+      2
+      3
+      4
+      7
+    ]
+  );
+
   makePolicyCommand = lib.escapeShellArgs (
     [
       "${config.systemd.package}/lib/systemd/systemd-pcrlock"
@@ -146,12 +225,12 @@ in
 {
   imports = [
     (lib.mkRemovedOptionModule [ "boot" "lanzaboote" "enrollKeys" ] ''
-      Removed this internal option intended for testig only without replacement.
+      Removed this internal option intended for testing only without replacement.
     '')
   ];
 
   options.boot.lanzaboote = {
-    enable = lib.mkEnableOption "Enable the LANZABOOTE";
+    enable = lib.mkEnableOption "Lanzaboote, a secure boot tool for NixOS";
 
     configurationLimit = lib.mkOption {
       default = config.boot.loader.systemd-boot.configurationLimit;
@@ -260,17 +339,6 @@ in
       };
     };
 
-    logLevel = lib.mkOption {
-      type = lib.types.enum [
-        "info"
-        "debug"
-      ];
-      default = "info";
-      description = ''
-        Log level of lzbt.
-      '';
-    };
-
     pcrSigning = {
       enable = lib.mkEnableOption "PCR 11 signing for measured boot";
       privateKeyFile = lib.mkOption {
@@ -298,6 +366,17 @@ in
       };
     };
 
+    logLevel = lib.mkOption {
+      type = lib.types.enum [
+        "info"
+        "debug"
+      ];
+      default = "info";
+      description = ''
+        Log level of lzbt.
+      '';
+    };
+
     installCommand = lib.mkOption {
       type = lib.types.str;
       readOnly = true;
@@ -315,11 +394,7 @@ in
           --systemd-boot-loader-config ${loaderConfigFile} \
           --configuration-limit ${toString configurationLimit} \
           --allow-unsigned ${lib.boolToString cfg.allowUnsigned} \
-          --bootcounting-initial-tries ${toString cfg.bootCounting.initialTries}''
-        + lib.optionalString cfg.pcrSigning.enable ''
-           \
-          --pcr-private-key ${cfg.pcrSigning.privateKeyFile} \
-          --pcr-public-key ${cfg.pcrSigning.publicKeyFile}'';
+          --bootcounting-initial-tries ${toString cfg.bootCounting.initialTries}'';
       defaultText = lib.literalExpression ''
         ''${lib.getExe config.boot.lanzaboote.package} ''${lib.optionalString (config.boot.lanzaboote.logLevel == "debug") "-vv"} install \
           --system ''${config.boot.kernelPackages.stdenv.hostPlatform.system} \
@@ -524,7 +599,6 @@ in
     ];
 
     boot.bootspec = {
-      enable = true;
       extensions."org.nix-community.lanzaboote" = {
         sort_key = config.boot.lanzaboote.sortKey;
       };
@@ -565,32 +639,71 @@ in
       "systemd-pcrlock-secureboot-policy.service"
       "systemd-pcrlock-secureboot-authority.service"
     ];
+    # The lock-* services scan the boot-time state of the system; they only
+    # make sense at the start of a boot, while the event log still matches
+    # the PCRs. Their unit files embed the systemd store path, so without
+    # this every systemd upgrade would restart them during the switch, where
+    # their event log validation can legitimately refuse and fail the whole
+    # activation.
+    systemd.services.systemd-pcrlock-firmware-code = lib.mkIf cfg.measuredBoot.enable {
+      restartIfChanged = false;
+    };
+    systemd.services.systemd-pcrlock-firmware-config = lib.mkIf cfg.measuredBoot.enable {
+      restartIfChanged = false;
+    };
     # Since we might want to include PCR7 (the Secure Boot policy) we can only
     # create these measurements after we have booted in a Secure Boot system
     # for the first time. Thus, run this only if Secure Boot is already enabled
     # if we autoEnrollKeys.
-    systemd.services.systemd-pcrlock-secureboot-policy =
-      lib.mkIf (cfg.measuredBoot.enable && cfg.autoEnrollKeys.enable)
-        {
-          unitConfig.ConditionSecurity = "uefi-secureboot";
-        };
-    systemd.services.systemd-pcrlock-secureboot-authority =
-      lib.mkIf (cfg.measuredBoot.enable && cfg.autoEnrollKeys.enable)
-        {
-          unitConfig.ConditionSecurity = "uefi-secureboot";
-        };
+    systemd.services.systemd-pcrlock-secureboot-policy = lib.mkMerge [
+      (lib.mkIf (cfg.measuredBoot.enable && cfg.autoEnrollKeys.enable) {
+        unitConfig.ConditionSecurity = "uefi-secureboot";
+      })
+      (lib.mkIf cfg.measuredBoot.enable { restartIfChanged = false; })
+    ];
+    systemd.services.systemd-pcrlock-secureboot-authority = lib.mkMerge [
+      (lib.mkIf (cfg.measuredBoot.enable && cfg.autoEnrollKeys.enable) {
+        unitConfig.ConditionSecurity = "uefi-secureboot";
+      })
+      (lib.mkIf cfg.measuredBoot.enable { restartIfChanged = false; })
+    ];
 
-    systemd.services.systemd-pcrlock-make-policy = lib.mkIf cfg.measuredBoot.enable {
-      wantedBy = [ "sysinit.target" ];
-      # Otherwise, systemd-pcrlock will not be able to write the boot loader
-      # credential to the ESP if you're not using an automounted ESP.
-      after = [ "local-fs.target" ];
+    systemd.services.systemd-pcrlock-make-policy = lib.mkMerge [
+      (lib.mkIf cfg.measuredBoot.enable {
+        wantedBy = [ "sysinit.target" ];
 
-      serviceConfig.ExecStart = [
-        "" # unset previous value
-        makePolicyCommand
-      ];
-    };
+        serviceConfig.ExecStart = [
+          "" # unset previous value
+          makePolicyCommand
+        ];
+      })
+
+      # make-policy writes the boot loader credential to the ESP. Upstream
+      # assumes the GPT auto-generator mounts the ESP early, but NixOS
+      # disables that generator and uses fstab mounts instead. Ensure the
+      # ESP is available.
+      (lib.mkIf (cfg.measuredBoot.enable || config.systemd.pcrlock.enable) {
+        after = [ "local-fs.target" ];
+
+        # The install hook refreshes the policy during the switch, so
+        # restarting this boot-time unit on activation is redundant.
+        restartIfChanged = false;
+      })
+
+      # The upstream unit predicts only the single point in the boot where
+      # the initrd unseals (--location=770), and covers PCRs that change
+      # between that point and the main runtime. Updating the NV index
+      # requires unsealing the recovery PIN under the old policy, and the
+      # install hook does that at switch time, where such a prediction can
+      # no longer match. Run the same firmware-PCR command as the install
+      # hook so the two writers never rewrite each other's prediction.
+      (lib.mkIf (config.systemd.pcrlock.enable && !cfg.measuredBoot.enable) {
+        serviceConfig.ExecStart = [
+          ""
+          combinedMakePolicyCommand
+        ];
+      })
+    ];
     systemd.targets.sysinit = lib.mkIf cfg.measuredBoot.enable {
       wants =
         lib.optionals (pcr 0 || pcr 2) [
@@ -731,40 +844,63 @@ in
       '';
     };
 
-    systemd.services.fwupd-pcrlock-unlock-firmware-code = lib.mkIf (
-      config.services.fwupd.enable
-      && config.systemd.pcrlock.enable
-      && cfg.fwupd.autoUnlockFirmwareCode
-    ) {
-      description = "Relax pcrlock firmware-code policy for fwupd-staged capsule updates";
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = [
-          "${config.systemd.package}/lib/systemd/systemd-pcrlock unlock-firmware-code"
-          "${config.systemd.package}/lib/systemd/systemd-pcrlock make-policy --recovery-pin=no"
-        ];
-      };
-      unitConfig = {
-        ConditionPathExistsGlob = "/sys/firmware/efi/efivars/fwupd-*-0abba7dc-e516-4167-bbf5-4d9d1c739416";
-        ConditionPathExists = [
-          "/var/lib/pcrlock.d/250-firmware-code-early.pcrlock.d/generated.pcrlock"
-          "/var/lib/pcrlock.d/550-firmware-code-late.pcrlock.d/generated.pcrlock"
-        ];
-      };
-    };
+    # systemd-measure signs the PCR 11 values for the boot phase strings
+    # from enter-initrd onwards, so the signed policy can only ever be
+    # satisfied when the phases are actually measured.
+    systemd.tpm2.pcrphases.enable = lib.mkIf cfg.pcrSigning.enable (lib.mkDefault true);
+    boot.initrd.systemd.tpm2.pcrphases.enable = lib.mkIf (
+      cfg.pcrSigning.enable && config.boot.initrd.systemd.enable
+    ) (lib.mkDefault true);
 
-    systemd.paths.fwupd-pcrlock-unlock-firmware-code = lib.mkIf (
-      config.services.fwupd.enable
-      && config.systemd.pcrlock.enable
-      && cfg.fwupd.autoUnlockFirmwareCode
-    ) {
-      description = "Watch for fwupd-staged capsule updates that require pcrlock firmware-code unlock";
-      wantedBy = [ "multi-user.target" ];
-      pathConfig = {
-        PathExistsGlob = "/sys/firmware/efi/efivars/fwupd-*-0abba7dc-e516-4167-bbf5-4d9d1c739416";
-        Unit = "fwupd-pcrlock-unlock-firmware-code.service";
-      };
-    };
+    # Copy PCR signature and public key from the initrd's /.extra/ (populated by
+    # the stub's CPIO delivery) to /run/systemd/ where systemd-cryptenroll and
+    # other tools expect them.  The 'C' type copies if the source exists and is
+    # a no-op otherwise, so this is safe even when the stub doesn't embed pcrsig.
+    boot.initrd.systemd.tmpfiles.settings."20-lanzaboote-stub" =
+      lib.mkIf config.boot.initrd.systemd.enable
+        {
+          "/run/systemd/tpm2-pcr-signature.json".C = {
+            argument = "/.extra/tpm2-pcr-signature.json";
+            mode = "0444";
+          };
+          "/run/systemd/tpm2-pcr-public-key.pem".C = {
+            argument = "/.extra/tpm2-pcr-public-key.pem";
+            mode = "0444";
+          };
+        };
+
+    systemd.services.fwupd-pcrlock-unlock-firmware-code =
+      lib.mkIf
+        (config.services.fwupd.enable && config.systemd.pcrlock.enable && cfg.fwupd.autoUnlockFirmwareCode)
+        {
+          description = "Relax pcrlock firmware-code policy for fwupd-staged capsule updates";
+          serviceConfig = {
+            Type = "oneshot";
+            ExecStart = [
+              "${config.systemd.package}/lib/systemd/systemd-pcrlock unlock-firmware-code"
+              "${combinedMakePolicyCommand} --recovery-pin=no"
+            ];
+          };
+          unitConfig = {
+            ConditionPathExistsGlob = "/sys/firmware/efi/efivars/fwupd-*-0abba7dc-e516-4167-bbf5-4d9d1c739416";
+            ConditionPathExists = [
+              "/var/lib/pcrlock.d/250-firmware-code-early.pcrlock.d/generated.pcrlock"
+              "/var/lib/pcrlock.d/550-firmware-code-late.pcrlock.d/generated.pcrlock"
+            ];
+          };
+        };
+
+    systemd.paths.fwupd-pcrlock-unlock-firmware-code =
+      lib.mkIf
+        (config.services.fwupd.enable && config.systemd.pcrlock.enable && cfg.fwupd.autoUnlockFirmwareCode)
+        {
+          description = "Watch for fwupd-staged capsule updates that require pcrlock firmware-code unlock";
+          wantedBy = [ "multi-user.target" ];
+          pathConfig = {
+            PathExistsGlob = "/sys/firmware/efi/efivars/fwupd-*-0abba7dc-e516-4167-bbf5-4d9d1c739416";
+            Unit = "fwupd-pcrlock-unlock-firmware-code.service";
+          };
+        };
 
     services.fwupd.uefiCapsuleSettings = lib.mkIf config.services.fwupd.enable {
       DisableShimForSecureBoot = true;
