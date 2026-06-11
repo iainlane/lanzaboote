@@ -58,6 +58,30 @@ let
     ''
   );
 
+  pcrlockComponents =
+    if config.systemd.pcrlock.enable then
+      pkgs.runCommand "pcrlock-components" { } ''
+        boot_loader_dir="$out/640-boot-loader.pcrlock.d"
+        boot_entry_dir="$out/650-boot-entry.pcrlock.d"
+        mkdir -p "$boot_loader_dir" "$boot_entry_dir"
+
+        ${lib.getExe cfg.package} lock-boot-loader \
+          --systemd ${config.systemd.package} \
+          --esp ${espFiles} \
+          --pcrlock "$boot_loader_dir"
+
+        for stub in "${espFiles}/EFI/Linux/nixos-"*".efi"; do
+          [ -f "$stub" ] || continue
+          ${lib.getExe cfg.package} lock-thin-stub \
+            --systemd ${config.systemd.package} \
+            --esp ${espFiles} \
+            --pcrlock "$boot_entry_dir" \
+            "$stub"
+        done
+      ''
+    else
+      null;
+
   closureInfo = pkgs.closureInfo {
     rootPaths = [ config.system.build.toplevel ];
   };
@@ -147,14 +171,18 @@ in
     }
     // lib.optionalAttrs config.lanzabooteTest.persistentRoot {
       "root" = {
-        contents = {
-          "/nix/var/nix".source = nixState;
-        };
+        contents =
+          {
+            "/nix/var/nix".source = nixState;
+          }
+          // lib.optionalAttrs config.systemd.pcrlock.enable {
+            "/var/lib/pcrlock.d".source = pcrlockComponents;
+          };
         repartConfig = {
           Type = "root";
           Format = config.fileSystems."/".fsType;
           Label = rootPartitionLabel;
-          SizeMinBytes = "1M";
+          SizeMinBytes = "64M";
         };
       };
     };

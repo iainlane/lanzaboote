@@ -9,27 +9,8 @@
       imports = [ ./common/lanzaboote.nix ];
 
       virtualisation.tpm.enable = true;
-
-      boot.initrd.systemd.storePaths = [
-        "${config.systemd.package}/lib/systemd/systemd-pcrextend"
-        "${pkgs.tpm2-tss}/lib"
-      ];
-
-      boot.initrd.systemd.additionalUpstreamUnits = [
-        "systemd-pcrphase-initrd.service"
-      ];
-
-      systemd.additionalUpstreamSystemUnits = [
-        "systemd-pcrphase.service"
-        "systemd-pcrphase-sysinit.service"
-      ];
-
-      environment.etc = {
-        systemd-pcrlock-builtin = {
-          target = "pcrlock.d";
-          source = "${config.systemd.package}/lib/pcrlock.d";
-        };
-      };
+      boot.initrd.systemd.enable = true;
+      systemd.tpm2.enable = true;
     };
 
   testScript =

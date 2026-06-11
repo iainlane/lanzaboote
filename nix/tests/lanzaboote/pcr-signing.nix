@@ -13,6 +13,8 @@ in
 
     virtualisation.tpm.enable = true;
 
+    boot.initrd.systemd.enable = true;
+
     environment.systemPackages = [
       pkgs.bintools-unwrapped
     ];
@@ -62,7 +64,6 @@ in
         )
 
       with subtest("tpm2-pcr-signature.json is delivered via tmpfiles"):
-        # systemd tmpfiles copies /.extra/tpm2-pcr-signature.json to /run/systemd/
         machine.succeed("test -f /run/systemd/tpm2-pcr-signature.json")
         pcrsig_delivered = machine.succeed("cat /run/systemd/tpm2-pcr-signature.json")
         pcrsig_data = json.loads(pcrsig_delivered)
