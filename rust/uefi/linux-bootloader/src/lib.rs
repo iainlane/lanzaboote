@@ -9,5 +9,7 @@ pub mod efivars;
 pub mod linux_loader;
 pub mod measure;
 pub mod pe_loader;
+pub mod smbios;
 pub mod tpm;
 pub mod uefi_helpers;
+pub mod vmm;

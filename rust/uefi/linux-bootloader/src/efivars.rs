@@ -111,6 +111,8 @@ bitflags! {
        const RandomSeed = 1 << 4;
        /// Are .cmdline sections picked up from addon PE files?
        const CmdlineAddons = 1 << 5;
+       /// Is the kernel command line extended from SMBIOS Type 11 OEM strings?
+       const CmdlineSmbios = 1 << 6;
        /// Are configuration extensions picked up from the boot partition?
        const PickUpConfExts = 1 << 8;
        /// Are `StubDevicePartUUID` and `StubImageIdentifier` loaded in UEFI variables?
@@ -179,6 +181,7 @@ pub fn export_efi_variables(stub_info_name: &str) -> Result<()> {
         | EfiStubFeatures::ThreePcrs
         | EfiStubFeatures::RandomSeed
         | EfiStubFeatures::CmdlineAddons
+        | EfiStubFeatures::CmdlineSmbios
         | EfiStubFeatures::PickUpConfExts
         | EfiStubFeatures::ReportStubPartition;
 

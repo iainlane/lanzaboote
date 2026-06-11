@@ -10,6 +10,7 @@ mod thin;
 
 use crate::thin::UkiComponents;
 use alloc::{
+    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -21,8 +22,10 @@ use linux_bootloader::companions::{
 use linux_bootloader::cpio::pack_cpio_literal;
 use linux_bootloader::efivars::{EfiLoaderFeatures, export_efi_variables, get_loader_features};
 use linux_bootloader::measure::{measure_companion_initrds, measure_image, measure_load_options};
+use linux_bootloader::smbios;
 use linux_bootloader::tpm::tpm_available;
 use linux_bootloader::uefi_helpers::{ParsedPe, booted_image_file};
+use linux_bootloader::vmm::is_confidential_vm;
 use log::{info, warn};
 use uefi::boot;
 use uefi::prelude::*;
@@ -248,12 +251,46 @@ fn main() -> Status {
         }
     }
 
+    // Extra command line arguments may also be passed in via the SMBIOS Type
+    // 11 OEM strings. They are appended after the addon command line and
+    // measured into PCR 12 as a separate event, after the addon measurement.
+    // SMBIOS data is controlled by the host and is not covered by the
+    // attestation of a confidential VM, so it must not be trusted there.
+    let mut smbios_cmdline: Option<String> = None;
+    if !is_confidential_vm()
+        && let Some(extra) = smbios::kernel_cmdline_extra()
+    {
+        info!("SMBIOS extra command line: {}", extra);
+
+        // The extra command line is input to the boot, so it must be
+        // measured before use. Refuse it entirely if it cannot be encoded
+        // for measurement.
+        match encode_cmdline_utf16(&extra) {
+            Ok(extra_utf16) => {
+                if is_tpm_available {
+                    let _ = measure_load_options(extra_utf16.as_bytes());
+                }
+                smbios_cmdline = Some(extra);
+            }
+            Err(err) => {
+                warn!(
+                    "Ignoring SMBIOS extra command line that cannot be encoded for measurement: {err:?}"
+                );
+            }
+        }
+    }
+
+    let extra_cmdline = match (addon_cmdline, smbios_cmdline) {
+        (Some(addon), Some(smbios)) => Some(format!("{addon} {smbios}")),
+        (addon, smbios) => addon.or(smbios),
+    };
+
     thin::boot_linux(
         boot::image_handle(),
         components,
         dynamic_initrds,
         resolved_cmdline.bytes,
-        addon_cmdline.as_deref(),
+        extra_cmdline.as_deref(),
     )
     .status()
 }
