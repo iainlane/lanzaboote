@@ -100,6 +100,10 @@
           toolClippy = checks.lzbt.clippy;
           toolRustfmt = checks.lzbt.rustfmt;
 
+          shared = checks.shared.package;
+          sharedClippy = checks.shared.clippy;
+          sharedRustfmt = checks.shared.rustfmt;
+
           stub = checks.stub.package;
           stubClippy = checks.stub.clippy;
           stubRustfmt = checks.stub.rustfmt;

@@ -32,6 +32,14 @@ rec {
   };
 
   checks = lib.recurseIntoAttrs {
+    shared = lib.recurseIntoAttrs {
+      package = packages.shared;
+      inherit (packages.shared.tests)
+        clippy
+        rustfmt
+        ;
+    };
+
     stub = lib.recurseIntoAttrs {
       package = packages.stub;
       inherit (packages.stub.tests)

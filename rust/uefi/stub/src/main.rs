@@ -75,7 +75,9 @@ fn main() -> Status {
         && !features.contains(EfiLoaderFeatures::RandomSeed)
     {
         // FIXME: read the random seed from the ESP and pass it to the kernel.
-        info!("The boot loader does not handle the random seed, and lanzaboote does not support passing it yet.");
+        info!(
+            "The boot loader does not handle the random seed, and lanzaboote does not support passing it yet."
+        );
     }
 
     if export_efi_variables(STUB_NAME).is_err() {

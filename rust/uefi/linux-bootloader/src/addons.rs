@@ -16,40 +16,11 @@ use uefi::{
 
 use crate::companions::find_files;
 use crate::uefi_helpers::{ParsedPe, PeLayout};
+use lanzaboote_shared::cmdline::{addon_matches_uki_uname, mangle_stub_cmdline};
 
 /// A command line fragment extracted from an addon PE file.
 pub struct CmdlineAddon {
     pub cmdline: String,
-}
-
-fn shall_be_whitespace(c: char) -> bool {
-    c <= '\u{20}' || c == '\u{7f}'
-}
-
-fn mangle_stub_cmdline(cmdline: &str) -> String {
-    let mut result = String::new();
-    let mut last_non_whitespace_len = 0;
-
-    for c in cmdline.chars().skip_while(|c| shall_be_whitespace(*c)) {
-        if shall_be_whitespace(c) {
-            result.push(' ');
-        } else {
-            result.push(c);
-            last_non_whitespace_len = result.len();
-        }
-    }
-
-    // Chop off trailing whitespace.
-    result.truncate(last_non_whitespace_len);
-
-    result
-}
-
-fn addon_matches_uki_uname(uki_uname: Option<&str>, addon_uname: Option<&str>) -> bool {
-    match (uki_uname, addon_uname) {
-        (Some(uki_uname), Some(addon_uname)) => addon_uname == uki_uname,
-        _ => true,
-    }
 }
 
 fn secure_load_addon_image(file_path: &Path) -> uefi::Result<Vec<u8>> {
@@ -256,28 +227,4 @@ fn collect_cmdline_addons(
 
 pub fn encode_cmdline_utf16(cmdline: &str) -> uefi::Result<CString16> {
     CString16::try_from(cmdline).map_err(|_| uefi::Status::INVALID_PARAMETER.into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{addon_matches_uki_uname, mangle_stub_cmdline};
-
-    #[test]
-    fn mangles_stub_cmdline_like_systemd() {
-        assert_eq!(mangle_stub_cmdline("  foo\tbar\nbaz  "), "foo bar baz");
-        assert_eq!(mangle_stub_cmdline(""), "");
-        assert_eq!(mangle_stub_cmdline(" \x7f "), "");
-    }
-
-    #[test]
-    fn addon_uname_matching_follows_systemd_stub_rules() {
-        assert!(addon_matches_uki_uname(None, None));
-        assert!(addon_matches_uki_uname(None, Some("6.12.0")));
-        assert!(addon_matches_uki_uname(Some("6.12.0"), None));
-        assert!(addon_matches_uki_uname(Some("6.12.0"), Some("6.12.0")));
-        assert!(!addon_matches_uki_uname(
-            Some("6.12.0"),
-            Some("definitely-not-6.12.0"),
-        ));
-    }
 }

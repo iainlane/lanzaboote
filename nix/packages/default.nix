@@ -66,6 +66,7 @@ let
   );
 in
 rec {
+  shared = pkgs.callPackage ./shared.nix { inherit buildRustApp; };
   stub = pkgs.callPackage ./stub.nix { inherit buildRustApp; };
   lzbt = pkgs.callPackage ./lzbt.nix {
     inherit buildRustApp;
