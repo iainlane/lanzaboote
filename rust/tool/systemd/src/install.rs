@@ -22,7 +22,7 @@ use lanzaboote_tool::esp::EspPaths;
 use lanzaboote_tool::gc::Roots;
 use lanzaboote_tool::generation::{Generation, GenerationLink};
 use lanzaboote_tool::os_release::OsRelease;
-use lanzaboote_tool::pe::{self, append_initrd_secrets, lanzaboote_image};
+use lanzaboote_tool::pe::{self, append_initrd_secrets, lanzaboote_image, resolve_efi_path};
 use lanzaboote_tool::signature::Signer;
 use lanzaboote_tool::utils::{SecureTempDirExt, file_hash};
 
@@ -431,11 +431,11 @@ impl<S: Signer> Installer<S> {
             .with_context(|| format!("Failed to read the stub: {}", stub_target.display()))?;
         let kernel_path = resolve_efi_path(
             &self.esp_paths.esp,
-            pe::read_section_data(&stub, ".linux").context("Missing kernel path.")?,
+            &pe::read_section_data(&stub, ".linux").context("Missing kernel path.")?,
         )?;
         let initrd_path = resolve_efi_path(
             &self.esp_paths.esp,
-            pe::read_section_data(&stub, ".initrd").context("Missing initrd path.")?,
+            &pe::read_section_data(&stub, ".initrd").context("Missing initrd path.")?,
         )?;
 
         if !kernel_path.exists() || !initrd_path.exists() {
@@ -610,11 +610,6 @@ impl<S: Signer> Installer<S> {
         log::info!("PCR 11 predictions signed successfully.");
         Ok(Some((pcrsig_data, pcrpkey_data)))
     }
-}
-
-/// Translate an EFI path to an absolute path on the mounted ESP.
-fn resolve_efi_path(esp: &Path, efi_path: &[u8]) -> Result<PathBuf> {
-    Ok(esp.join(std::str::from_utf8(&efi_path[1..])?.replace('\\', "/")))
 }
 
 /// Compute the file name to be used for the stub of a certain generation, signed with the given key.

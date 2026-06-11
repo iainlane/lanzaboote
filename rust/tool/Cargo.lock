@@ -519,6 +519,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lanzaboote_shared"
+version = "1.0.0"
+
+[[package]]
 name = "lanzaboote_tool"
 version = "1.0.0"
 dependencies = [
@@ -571,6 +575,7 @@ dependencies = [
  "filetime",
  "goblin",
  "indoc",
+ "lanzaboote_shared",
  "lanzaboote_tool",
  "log",
  "nix",

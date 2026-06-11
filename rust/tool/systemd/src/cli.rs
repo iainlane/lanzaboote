@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::install;
+use crate::{install, pcrlock};
 use lanzaboote_tool::{
     architecture::Architecture,
     signature::{EmptyKeyPair, LocalKeyPair},
@@ -29,6 +29,9 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Install(InstallCommand),
+    LockBootLoader(LockBootLoaderCommand),
+    LockThinStub(LockThinStubCommand),
+    GcPcrlock(GcPcrlockCommand),
 }
 
 #[derive(Parser)]
@@ -83,6 +86,54 @@ struct InstallCommand {
     generations: Vec<PathBuf>,
 }
 
+#[derive(Parser)]
+struct LockThinStubCommand {
+    /// Systemd path
+    #[arg(long)]
+    systemd: PathBuf,
+
+    /// EFI system partition mountpoint
+    #[arg(long)]
+    esp: PathBuf,
+
+    /// Output .pcrlock file path
+    #[arg(long)]
+    pcrlock: PathBuf,
+
+    /// Installed thin stub on the ESP
+    stub: PathBuf,
+}
+
+#[derive(Parser)]
+struct LockBootLoaderCommand {
+    /// Systemd path
+    #[arg(long)]
+    systemd: PathBuf,
+
+    /// EFI system partition mountpoint
+    #[arg(long)]
+    esp: PathBuf,
+
+    /// Output .pcrlock file path
+    #[arg(long)]
+    pcrlock: PathBuf,
+}
+
+#[derive(Parser)]
+struct GcPcrlockCommand {
+    /// Systemd path
+    #[arg(long)]
+    systemd: PathBuf,
+
+    /// Directory holding the .pcrlock variant files
+    #[arg(long)]
+    pcrlock: PathBuf,
+
+    /// PE hash of a variant to keep; may be given multiple times
+    #[arg(long)]
+    keep: Vec<String>,
+}
+
 impl Cli {
     pub fn call(self, module: &str) {
         stderrlog::new()
@@ -104,6 +155,30 @@ impl Commands {
     pub fn call(self) -> Result<()> {
         match self {
             Commands::Install(args) => install(args),
+            Commands::LockBootLoader(args) => {
+                let result = pcrlock::lock_boot_loader(pcrlock::LockBootLoaderArgs {
+                    systemd: args.systemd,
+                    esp: args.esp,
+                    pcrlock: args.pcrlock,
+                })?;
+                println!("{}", result.pe_hash);
+                Ok(())
+            }
+            Commands::LockThinStub(args) => {
+                let result = pcrlock::lock_thin_stub(pcrlock::LockThinStubArgs {
+                    systemd: args.systemd,
+                    esp: args.esp,
+                    pcrlock: args.pcrlock,
+                    stub: args.stub,
+                })?;
+                println!("{}", result.pe_hash);
+                Ok(())
+            }
+            Commands::GcPcrlock(args) => pcrlock::gc(pcrlock::GcArgs {
+                systemd: args.systemd,
+                pcrlock: args.pcrlock,
+                keep: args.keep,
+            }),
         }
     }
 }

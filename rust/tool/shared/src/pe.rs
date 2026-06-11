@@ -1,11 +1,12 @@
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::cmp::min;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result};
-use goblin::pe::PE;
+use anyhow::{Context, Result, ensure};
+use goblin::pe::{PE, section_table::SectionTable};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
@@ -265,22 +266,44 @@ fn file_size(path: impl AsRef<Path>) -> Result<u64> {
         .size())
 }
 
-/// Read the data from a section of a PE binary.
-///
-/// The binary is supplied as a `u8` slice.
-pub fn read_section_data<'a>(file_data: &'a [u8], section_name: &str) -> Option<&'a [u8]> {
+/// Read the data from a section of a PE binary and pad it to the section's virtual size.
+pub fn read_section_data(file_data: &[u8], section_name: &str) -> Option<Vec<u8>> {
     let pe_binary = goblin::pe::PE::parse(file_data).ok()?;
 
     pe_binary
         .sections
         .iter()
         .find(|s| s.name().unwrap() == section_name)
-        .and_then(|s| {
-            let section_start: usize = s.pointer_to_raw_data.try_into().ok()?;
-            assert!(s.virtual_size <= s.size_of_raw_data);
-            let section_end: usize = section_start + usize::try_from(s.virtual_size).ok()?;
-            Some(&file_data[section_start..section_end])
-        })
+        .and_then(|s| read_named_section_data(file_data, s))
+}
+
+pub fn read_section_as_string(file_data: &[u8], section_name: &str) -> Option<String> {
+    read_section_data(file_data, section_name).and_then(|data| {
+        let len = data.iter().position(|b| *b == 0).unwrap_or(data.len());
+        String::from_utf8(data[..len].to_vec()).ok()
+    })
+}
+
+fn read_named_section_data(file_data: &[u8], section: &SectionTable) -> Option<Vec<u8>> {
+    let section_start: usize = section.pointer_to_raw_data.try_into().ok()?;
+    let section_data_len: usize = min(section.virtual_size, section.size_of_raw_data)
+        .try_into()
+        .ok()?;
+    let section_end = section_start.checked_add(section_data_len)?;
+
+    let mut section_data = file_data[section_start..section_end].to_vec();
+    section_data.resize(section.virtual_size.try_into().ok()?, 0);
+    Some(section_data)
+}
+
+/// Translate an EFI path (e.g. `\EFI\Linux\kernel.efi`) to an absolute path on the mounted ESP.
+pub fn resolve_efi_path(esp: &Path, efi_path: &[u8]) -> Result<PathBuf> {
+    ensure!(
+        efi_path.first() == Some(&b'\\'),
+        "Invalid EFI path {:?}",
+        String::from_utf8_lossy(efi_path)
+    );
+    Ok(esp.join(std::str::from_utf8(&efi_path[1..])?.replace('\\', "/")))
 }
 
 #[cfg(test)]

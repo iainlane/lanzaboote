@@ -36,11 +36,11 @@ impl SystemdVersion {
         // The `.osrel` section in the systemd-boot binary may be NUL-terminated or not
         // so we need to handle both cases.
         let section_data_string = match section_data[section_data.len() - 1] {
-            0 => CStr::from_bytes_with_nul(section_data)
+            0 => CStr::from_bytes_with_nul(&section_data)
                 .context("Failed to parse C string.")?
                 .to_str()
                 .context("Failed to convert C string to Rust string.")?,
-            b'\n' => str::from_utf8(section_data)
+            b'\n' => str::from_utf8(&section_data)
                 .context("Failed to convert section data to Rust string.")?,
             _ => bail!("PE section '.osrel' has unexpected content"),
         };
