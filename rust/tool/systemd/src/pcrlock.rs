@@ -206,8 +206,7 @@ fn write_pcrlock(path: &Path, records: &[Value]) -> Result<()> {
     }
     let output = serde_json::to_vec_pretty(&json!({ "records": records }))
         .context("Failed to serialize pcrlock records")?;
-    fs::write(path, output)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
+    fs::write(path, output).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -228,8 +227,12 @@ fn generate_records(systemd: &Path, esp: &Path, stub: &Path) -> Result<Vec<Value
         }
 
         let section_bytes = match section.data_source() {
-            UnifiedSectionDataSource::ExternalKernel => Some(Cow::Borrowed(kernel_bytes.as_slice())),
-            UnifiedSectionDataSource::ExternalInitrd => Some(Cow::Borrowed(initrd_bytes.as_slice())),
+            UnifiedSectionDataSource::ExternalKernel => {
+                Some(Cow::Borrowed(kernel_bytes.as_slice()))
+            }
+            UnifiedSectionDataSource::ExternalInitrd => {
+                Some(Cow::Borrowed(initrd_bytes.as_slice()))
+            }
             UnifiedSectionDataSource::Embedded => {
                 read_section_data(&stub_bytes, section.name()).map(Cow::Owned)
             }
@@ -272,7 +275,11 @@ fn discover_boot_loader(esp: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("Failed to locate a systemd-boot PE on {}", esp.display()))
 }
 
-fn resolve_section_efi_path(esp: &Path, stub_bytes: &[u8], section: UnifiedSection) -> Result<PathBuf> {
+fn resolve_section_efi_path(
+    esp: &Path,
+    stub_bytes: &[u8],
+    section: UnifiedSection,
+) -> Result<PathBuf> {
     let raw_path = read_section_as_string(stub_bytes, section.name())
         .ok_or_else(|| anyhow!("Missing {} section", section.name()))?;
     resolve_efi_path(esp, raw_path.as_bytes())

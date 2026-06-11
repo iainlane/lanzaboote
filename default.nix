@@ -41,8 +41,8 @@ rec {
     };
 
     lzbt = lib.recurseIntoAttrs {
-      package = packages.stub;
-      inherit (packages.stub.tests)
+      package = packages.lzbt;
+      inherit (packages.lzbt.tests)
         clippy
         rustfmt
         ;

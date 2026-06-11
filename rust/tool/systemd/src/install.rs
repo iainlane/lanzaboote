@@ -578,10 +578,8 @@ impl<S: Signer> Installer<S> {
 
         log::info!("Signing PCR 11 predictions...");
 
-        let os_release_file =
-            tempdir.write_secure_file(os_release_contents)?;
-        let cmdline_file =
-            tempdir.write_secure_file(kernel_cmdline.join(" "))?;
+        let os_release_file = tempdir.write_secure_file(os_release_contents)?;
+        let cmdline_file = tempdir.write_secure_file(kernel_cmdline.join(" "))?;
 
         let systemd_measure = self.systemd.join("lib/systemd/systemd-measure");
 
@@ -638,7 +636,9 @@ fn stub_prefix<S: Signer>(
     let bootspec = &generation.spec.bootspec.bootspec;
     let public_key = signer.get_public_key()?;
     let pcr_pkey_hash = match pcr_public_key {
-        Some(path) => file_hash(path).context("Failed to hash PCR public key file.")?.to_vec(),
+        Some(path) => file_hash(path)
+            .context("Failed to hash PCR public key file.")?
+            .to_vec(),
         None => Vec::new(),
     };
     let stub_inputs = [

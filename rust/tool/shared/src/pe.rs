@@ -1,7 +1,7 @@
+use std::cmp::min;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::cmp::min;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

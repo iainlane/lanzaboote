@@ -96,9 +96,9 @@
           measuredBootChecks = lanzabooteMeasuredBoot.${system}.checks;
         in
         {
-          tool = checks.stub.package;
-          toolClippy = checks.stub.clippy;
-          toolRustfmt = checks.stub.rustfmt;
+          tool = checks.lzbt.package;
+          toolClippy = checks.lzbt.clippy;
+          toolRustfmt = checks.lzbt.rustfmt;
 
           stub = checks.stub.package;
           stubClippy = checks.stub.clippy;
