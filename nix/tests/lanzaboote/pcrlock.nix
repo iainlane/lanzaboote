@@ -17,6 +17,17 @@
       boot.initrd.systemd.enable = true;
 
       systemd.pcrlock.enable = true;
+      boot.lanzaboote.pcrlockPcrs = [
+        0
+        1
+        2
+        3
+        4
+        7
+        13
+        15
+      ];
+      boot.lanzaboote.configurationLimit = 3;
 
       system.extraDependencies = [ config.boot.loader.external.installHook ];
     };

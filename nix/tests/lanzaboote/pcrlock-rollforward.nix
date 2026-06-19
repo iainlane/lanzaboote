@@ -17,6 +17,17 @@
       boot.initrd.systemd.enable = true;
 
       systemd.pcrlock.enable = true;
+      boot.lanzaboote.pcrlockPcrs = [
+        0
+        1
+        2
+        3
+        4
+        7
+        13
+        15
+      ];
+      boot.lanzaboote.configurationLimit = 3;
 
       system.extraDependencies = [ config.boot.loader.external.installHook ];
 
@@ -24,7 +35,10 @@
       # (different .cmdline PE section) and therefore a different PE hash on
       # the ESP, exercising the lock-pe multi-hash path.
       specialisation.gen2.configuration = {
-        boot.kernelParams = lib.mkForce [ "quiet" "loglevel=3" ];
+        boot.kernelParams = lib.mkForce [
+          "quiet"
+          "loglevel=3"
+        ];
       };
     };
 

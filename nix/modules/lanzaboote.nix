@@ -407,8 +407,19 @@ in
     enable = lib.mkEnableOption "Lanzaboote, a secure boot tool for NixOS";
 
     configurationLimit = lib.mkOption {
-      default = config.boot.loader.systemd-boot.configurationLimit;
-      defaultText = "config.boot.loader.systemd-boot.configurationLimit";
+      default =
+        if
+          config.boot.loader.systemd-boot.configurationLimit == null
+          && (cfg.measuredBoot.enable || config.systemd.pcrlock.enable)
+        then
+          5
+        else
+          config.boot.loader.systemd-boot.configurationLimit;
+      defaultText = lib.literalExpression ''
+        if config.boot.loader.systemd-boot.configurationLimit == null
+        && (cfg.measuredBoot.enable || config.systemd.pcrlock.enable) then 5
+        else config.boot.loader.systemd-boot.configurationLimit
+      '';
       example = 120;
       type = lib.types.nullOr lib.types.int;
       description = ''
@@ -417,6 +428,13 @@ in
 
         `null` means no limit i.e. all generations
         that were not garbage collected yet.
+
+        With Measured Boot or systemd-pcrlock enabled, predictions take one
+        alternative value per generation on some PCRs (per-UKI system
+        extensions on PCR 13, and PCR 4 when it is covered), and
+        systemd-pcrlock caps a PCR at 8 alternatives. The default is
+        therefore 5 in that case. Covering PCR 4 via
+        {option}`pcrlockPcrs` lowers the workable limit to 3.
       '';
     };
 
@@ -557,10 +575,8 @@ in
       );
       default = [
         0
-        1
         2
         3
-        4
         7
         13
         15
@@ -575,6 +591,27 @@ in
         it would limit the ESP to two generations. Bind PCR 11 through the
         signed policy shard (`pcrSigning`) instead, which keeps working
         however many generations are installed.
+
+        PCR 1 is not covered by default because it is the firmware's
+        platform-configuration register, into which many firmwares measure
+        data that changes outside the pcrlock prediction: the `BootOrder`
+        and `Boot####` EFI variables, and on some systems unstable values
+        such as SMBIOS voltages or temperatures. systemd-pcrlock(8)
+        documents that such measurements mean "this form of lockdown cannot
+        be used reliably on such systems". When PCR 1 drifts the next boot
+        falls back to the passphrase, so it is left out by default; the
+        boot chain is still attested by PCR 0, PCR 7 and the signed PCR 11
+        shard. Add 1 here only on hardware whose PCR 1 is known to be
+        stable.
+
+        PCR 4 is not covered by default for a related budget reason: its
+        predicted values multiply the boot entry count by the two
+        alternative separator digests, so the eight-alternative limit caps
+        the ESP at four generations, and at three across a switch. Under
+        enforcing Secure Boot its marginal protection is small: PCR 7
+        attests the signing policy and the signed PCR 11 shard attests the
+        exact UKI. Add 4 here if you accept `configurationLimit` of at most
+        3.
       '';
     };
 
@@ -828,13 +865,37 @@ in
         '';
       }
       {
-        assertion = cfg.measuredBoot.enable -> (configurationLimit > 0 && configurationLimit <= 8);
+        assertion =
+          (cfg.measuredBoot.enable || config.systemd.pcrlock.enable)
+          -> (configurationLimit > 0 && configurationLimit <= 8);
         message = ''
-          If Measured Boot is enabled, you cannot store more than 8 generations on the ESP.
+          With Measured Boot or systemd-pcrlock enabled, you cannot store more
+          than 8 generations on the ESP.
 
-            This is a strict limit required and enforced by systemd-pcrlock.
+            Predictions take one alternative value per generation on some
+            PCRs, and systemd-pcrlock enforces a strict limit of 8
+            alternatives per PCR.
 
-            Set `boot.lanzaboote.configurationLimit = 8;` to reduce the number of generations you store.
+            Set `boot.lanzaboote.configurationLimit = 8;` or fewer to reduce
+            the number of generations you store.
+        '';
+      }
+      {
+        assertion =
+          (config.systemd.pcrlock.enable && lib.elem 4 cfg.pcrlockPcrs) -> (configurationLimit <= 3);
+        message = ''
+          Covering PCR 4 with the pcrlock policy limits the ESP to 3
+          generations.
+
+            PCR 4's predicted values multiply the boot entry count by the two
+            alternative separator digests, and a switch retains the booted
+            entry's variant on top, so any `boot.lanzaboote.configurationLimit`
+            above 3 overruns systemd-pcrlock's limit of 8 alternatives per
+            PCR.
+
+            Lower the limit, or remove 4 from `boot.lanzaboote.pcrlockPcrs`
+            (the default): under Secure Boot, PCR 7 and the signed PCR 11
+            shard already attest the boot chain.
         '';
       }
     ];
